@@ -1,0 +1,17 @@
+# GeoAI v3.1 — Gerekli Paketler
+# Kurulum: pip install -r requirements.txt
+
+# Zorunlu
+numpy>=1.21
+pandas>=1.3
+scipy>=1.7
+scikit-learn>=1.1
+matplotlib>=3.4
+joblib>=1.0
+
+# GeoTIFF desteği için (önerilir)
+# Windows'ta sorun çıkarsa: conda install rasterio
+rasterio>=1.2
+
+# rasterio alternatifi (otomatik fallback)
+Pillow>=8.0
