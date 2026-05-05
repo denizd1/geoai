@@ -1,6 +1,3 @@
-Readme · MD
-Copy
-
 # GeoAI - Geophysical AI Target Detection System
  
 > 🇹🇷 [Türkçe için aşağı kaydırın](#geoai--jeofizik-yapay-zeka-hedef-belirleme-sistemi)
