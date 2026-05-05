@@ -1,7 +1,7 @@
 Readme · MD
 Copy
 
-# GeoAI — Geophysical AI Target Detection System
+# GeoAI - Geophysical AI Target Detection System
  
 > 🇹🇷 [Türkçe için aşağı kaydırın](#geoai--jeofizik-yapay-zeka-hedef-belirleme-sistemi)
  
@@ -121,7 +121,7 @@ geoai/
  
 ---
  
-# GeoAI — Jeofizik Yapay Zeka Hedef Belirleme Sistemi
+# GeoAI - Jeofizik Yapay Zeka Hedef Belirleme Sistemi
  
 > 🇬🇧 [Scroll up for English](#geoai--geophysical-ai-target-detection-system)
  
