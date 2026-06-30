@@ -4,21 +4,21 @@
  
 ## Overview
  
-Mineral, groundwater, and geothermal exploration all face the same core challenge: turning several independently acquired geophysical surveys — magnetics, gravity, resistivity, induced polarization, geochemistry — into one defensible map of where to look next. GeoAI automates that integration end to end. It co-registers heterogeneous layers onto a common grid, engineers features from each one, and trains an ensemble of Artificial Neural Network, Random Forest, and Gradient Boosting models against known well or drillhole outcomes to learn what a real target actually looks like in the data.
+Mineral, groundwater, and geothermal exploration all face the same core challenge: turning several independently acquired geophysical surveys; magnetics, gravity, resistivity, induced polarization, geochemistry into one defensible map of where to look next. GeoAI automates that integration end to end. It co-registers heterogeneous layers onto a common grid, engineers features from each one, and trains an ensemble of Artificial Neural Network, Random Forest, and Gradient Boosting models against known well or drillhole outcomes to learn what a real target actually looks like in the data.
  
 The result is a cross-validated prospectivity probability map paired with an uncertainty estimate, from which the pipeline automatically extracts, ranks, and exports the most promising target locations. When a project covers multiple target types, GeoAI also generates feature-importance reports and side-by-side comparison maps across them.
  
-GeoAI works with the file formats exploration geophysicists already use — Surfer GRD (ASCII, Binary, and Surfer 7), GeoTIFF, Geosoft GRD, and XYZ/CSV/DAT with automatic grid interpolation — and reads training labels from a simple well/drillhole CSV schema. A built-in synthetic-data demo lets you run the full pipeline before ever connecting real survey data.
+GeoAI works with the file formats exploration geophysicists already use Surfer GRD (ASCII, Binary, and Surfer 7), GeoTIFF, Geosoft GRD, and XYZ/CSV/DAT with automatic grid interpolation, and reads training labels from a simple well/drillhole CSV schema. A built-in synthetic-data demo lets you run the full pipeline before ever connecting real survey data.
  
 ### Key Features
  
-- **Multi-layer data fusion** — combines magnetic, gravity, resistivity, IP, and geochemical layers into one co-registered feature stack
-- **Supervised prospectivity modeling** — an ANN + Random Forest + Gradient Boosting ensemble, trained and cross-validated against known well/drillhole outcomes
-- **Multiple target types per project** — mineral, groundwater, geothermal, or fully generic, each with its own feature-priority weighting
-- **Industry-standard I/O** — native support for Surfer GRD, GeoTIFF, Geosoft GRD, and XYZ/CSV/DAT with automatic interpolation
-- **Uncertainty-aware outputs** — probability maps paired with uncertainty estimates, not just point predictions
-- **Ranked target extraction** — automatically identifies and exports the top N target locations with coordinates
-- **Built-in reporting** — feature importance, cross-validation metrics, and multi-target comparison visualizations out of the box
+- **Multi-layer data fusion** - combines magnetic, gravity, resistivity, IP, and geochemical layers into one co-registered feature stack
+- **Supervised prospectivity modeling** - an ANN + Random Forest + Gradient Boosting ensemble, trained and cross-validated against known well/drillhole outcomes
+- **Multiple target types per project** - mineral, groundwater, geothermal, or fully generic, each with its own feature-priority weighting
+- **Industry-standard I/O** - native support for Surfer GRD, GeoTIFF, Geosoft GRD, and XYZ/CSV/DAT with automatic interpolation
+- **Uncertainty-aware outputs** - probability maps paired with uncertainty estimates, not just point predictions
+- **Ranked target extraction** - automatically identifies and exports the top N target locations with coordinates
+- **Built-in reporting** - feature importance, cross-validation metrics, and multi-target comparison visualizations out of the box
 ## Installation Requirements
  
 ```bash
@@ -149,13 +149,13 @@ GeoAI, jeofizik aramacıların zaten kullandığı dosya formatlarıyla çalış
  
 ### Öne Çıkan Özellikler
  
-- **Çok katmanlı veri birleştirimi** — manyetik, gravite, rezistivite, IP ve jeokimyasal katmanları tek bir ortak grid üzerinde birleştirilmiş öznitelik setine dönüştürür
-- **Gözetimli prospectivity modellemesi** — ANN + Random Forest + Gradient Boosting ensemble'ı, bilinen kuyu/sondaj sonuçlarına karşı eğitilir ve cross-validation ile doğrulanır
-- **Tek projede birden fazla hedef tipi** — maden, yeraltı suyu, jeotermal veya tamamen genel; her biri kendi öznitelik öncelik ağırlıklandırmasıyla
-- **Sektör standardı I/O desteği** — Surfer GRD, GeoTIFF, Geosoft GRD ve otomatik interpolasyonlu XYZ/CSV/DAT formatlarına yerel destek
-- **Belirsizlik farkındalıklı çıktılar** — sadece nokta tahminleri değil, belirsizlik tahminiyle eşleştirilmiş olasılık haritaları
-- **Sıralı hedef çıkarımı** — en yüksek olasılıklı N hedef lokasyonunu koordinatlarıyla birlikte otomatik olarak tespit eder ve dışa aktarır
-- **Hazır raporlama** — feature importance, cross-validation metrikleri ve çoklu hedef karşılaştırma görselleştirmeleri kutudan çıktığı gibi hazır
+- **Çok katmanlı veri birleştirimi** - manyetik, gravite, rezistivite, IP ve jeokimyasal katmanları tek bir ortak grid üzerinde birleştirilmiş öznitelik setine dönüştürür
+- **Gözetimli prospectivity modellemesi** - ANN + Random Forest + Gradient Boosting ensemble'ı, bilinen kuyu/sondaj sonuçlarına karşı eğitilir ve cross-validation ile doğrulanır
+- **Tek projede birden fazla hedef tipi** - maden, yeraltı suyu, jeotermal veya tamamen genel; her biri kendi öznitelik öncelik ağırlıklandırmasıyla
+- **Sektör standardı I/O desteği** - Surfer GRD, GeoTIFF, Geosoft GRD ve otomatik interpolasyonlu XYZ/CSV/DAT formatlarına yerel destek
+- **Belirsizlik farkındalıklı çıktılar** - sadece nokta tahminleri değil, belirsizlik tahminiyle eşleştirilmiş olasılık haritaları
+- **Sıralı hedef çıkarımı** - en yüksek olasılıklı N hedef lokasyonunu koordinatlarıyla birlikte otomatik olarak tespit eder ve dışa aktarır
+- **Hazır raporlama** - feature importance, cross-validation metrikleri ve çoklu hedef karşılaştırma görselleştirmeleri kutudan çıktığı gibi hazır
 ## Kurulum Gereksinimleri
  
 ```bash
