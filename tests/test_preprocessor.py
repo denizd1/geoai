@@ -165,14 +165,18 @@ def test_extract_features_fills_nan(rng):
 
 # ─── Normalizer ─────────────────────────────────────────────────────────────
 
-def test_normalizer_median_iqr_and_clip(rng):
+def test_normalizer_median_iqr_and_soft_bound(rng):
     X = rng.normal(loc=50, scale=10, size=(10000, 2)).astype(np.float32)
     X[0, 0] = 1e6                                    # outlier
     Z = RobustGridNormalizer().fit_transform(X)
+    assert Z.dtype == np.float32
     assert abs(np.median(Z[:, 0])) < 0.02
     q25, q75 = np.percentile(Z[:, 1], [25, 75])
     assert q75 - q25 == pytest.approx(1.0, abs=0.03)
     assert Z.max() <= 5 and Z.min() >= -5
+    # Soft bound: the outlier is the (single) largest value, close to z_clip
+    assert Z[0, 0] == Z[:, 0].max() and Z[0, 0] > 4.99
+    assert (Z[1:, 0] < Z[0, 0]).all()
 
 
 def test_normalizer_constant_and_degenerate_features():
@@ -183,6 +187,10 @@ def test_normalizer_constant_and_degenerate_features():
     assert np.isfinite(Z).all()
     assert np.all(Z[:, 0] == 0)
     assert Z[95:, 1].max() < 5                       # must not be pinned to ±5 by a 1e-10 division
+    # Scale = std of the unclipped column; the two levels stay distinct
+    std = np.std(X[:, 1].astype(np.float64))
+    assert Z[95, 1] == pytest.approx(5 * np.tanh((10.0 - 3.0) / std / 5), rel=1e-6)
+    assert np.all(Z[:95, 1] == 0)
 
 
 def test_normalizer_preserves_nan_and_checks_shape(rng):

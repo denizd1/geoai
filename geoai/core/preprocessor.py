@@ -4,20 +4,24 @@ geoai.core.preprocessor
 Multi-source geophysical data preprocessing:
   - Co-registration (alignment onto a common grid) + data-coverage masks
   - NaN filling
-  - Geophysical derivative filters (Fourier-based vertical derivative / upward continuation)
+  - Geographic (lon/lat) grid detection and metric cell sizes
+  - Geophysical filters (Fourier-based vertical derivative, upward continuation,
+    reduction to the pole)
   - Layer type detection and feature matrix construction
   - Robust normalization
 """
 
 import re
 import warnings
+from collections.abc import Mapping
 
 import numpy as np
 from scipy.interpolate import RegularGridInterpolator, griddata
 from scipy.ndimage import (
-    distance_transform_edt, gaussian_filter, maximum_filter, minimum_filter,
+    distance_transform_edt, gaussian_filter, label, maximum_filter, minimum_filter,
     sobel, uniform_filter,
 )
+from scipy.spatial import cKDTree
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -85,11 +89,18 @@ class CoRegistrar:
       ref_x, ref_y : reference grid pixel-centre coordinates (ascending)
       dx, dy       : reference cell size
     After transform_all():
-      masks        : {layer: bool (ny, nx)} — True = NO real data
-                     (original gap or outside the layer's coverage)
+      masks         : {layer: bool (ny, nx)} — True = NO real data
+                      (original gap or outside the layer's coverage)
+      outside_masks : {layer: bool (ny, nx)} — True = outside the layer's extent
+    See coverage_mask() for a combined "real data nearby in every layer" mask.
     """
 
     MAX_PIXELS = 2000
+    # coverage_mask(): connected clusters of data pixels up to this size count as
+    # a single sample (e.g. one node of a coarser source grid upsampled onto the
+    # reference grid); larger clusters contribute every pixel.
+    SAMPLE_CLUSTER_MAX_PIXELS = 64
+    SPACING_MAX_POINTS = 20000
 
     def __init__(self, method: str = 'linear'):
         """
@@ -107,6 +118,8 @@ class CoRegistrar:
         self.dy = None
         self.common_extent = None
         self.masks = {}
+        self.outside_masks = {}
+        self.coverage_tolerance = {}
         self._fitted = False
 
     def fit(
@@ -192,6 +205,8 @@ class CoRegistrar:
         self.dy = float(self.ref_y[1] - self.ref_y[0])
         self.common_extent = common_extent
         self.masks = {}
+        self.outside_masks = {}
+        self.coverage_tolerance = {}
         self._fitted = True
 
         print(
@@ -207,6 +222,27 @@ class CoRegistrar:
     def cell_area(self) -> float:
         return abs(self.dx * self.dy)
 
+    def filter_cell_size(self, crs=None, geographic: bool = None) -> tuple:
+        """
+        Cell size (dx, dy) to pass to the filters / extract_features.
+
+        For a geographic (lon/lat) reference grid the cell size in degrees is
+        converted to metres at the grid's central latitude (metric_cell_size);
+        otherwise (dx, dy) is returned unchanged.
+        geographic : True / False forces the decision; None → looks_geographic(
+                     ref_x, ref_y, crs) (pass the layers' CRS when known, the
+                     coordinate heuristic alone cannot tell a small local metric
+                     grid near the origin from a lon/lat grid).
+        """
+        if not self._fitted:
+            raise RuntimeError("Call .fit() first.")
+        if geographic is None:
+            geographic = looks_geographic(self.ref_x, self.ref_y, crs)
+        if not geographic:
+            return self.dx, self.dy
+        lat_c = 0.5 * (float(self.ref_y[0]) + float(self.ref_y[-1]))
+        return metric_cell_size(self.dx, self.dy, lat_c)
+
     def transform_layer(self, layer_dict: dict, return_mask: bool = False):
         """
         Resamples a single layer onto the reference grid.
@@ -216,6 +252,11 @@ class CoRegistrar:
         If return_mask=True, returns (grid, nodata_mask); nodata_mask True =
         no real measurement at that pixel.
         """
+        result, nodata, _ = self._resample(layer_dict)
+        return (result, nodata) if return_mask else result
+
+    def _resample(self, layer_dict: dict) -> tuple:
+        """transform_layer() core: returns (grid, nodata_mask, outside_extent_mask)."""
         if not self._fitted:
             raise RuntimeError("Call .fit() first.")
 
@@ -239,8 +280,8 @@ class CoRegistrar:
                 f"Layer is entirely NaN: {layer_dict.get('name', '?')}",
                 UserWarning
             )
-            out = np.full(shape, np.nan)
-            return (out, np.ones(shape, dtype=bool)) if return_mask else out
+            return (np.full(shape, np.nan), np.ones(shape, dtype=bool),
+                    np.zeros(shape, dtype=bool))
 
         filled = fill_nans(src_grid) if src_nodata.any() else src_grid
 
@@ -270,17 +311,23 @@ class CoRegistrar:
         result[outside] = np.nan
         nodata |= outside
 
-        return (result, nodata) if return_mask else result
+        return result, nodata, outside
 
     def transform_all(self, layers: dict) -> dict:
-        """Transforms all layers onto the reference grid (masks are stored in self.masks)."""
+        """
+        Transforms all layers onto the reference grid. The no-data masks are
+        stored in self.masks, the outside-extent masks in self.outside_masks.
+        """
         registered = {}
         self.masks = {}
+        self.outside_masks = {}
+        self.coverage_tolerance = {}
         for name, layer in layers.items():
             try:
-                grid, nodata = self.transform_layer(layer, return_mask=True)
+                grid, nodata, outside = self._resample(layer)
                 registered[name] = grid
                 self.masks[name] = nodata
+                self.outside_masks[name] = outside
                 pct = 100 * nodata.mean()
                 status = f"({pct:.1f}% no data)" if pct > 0 else "✓"
                 print(f"    {status} {name}: {grid.shape}")
@@ -292,6 +339,102 @@ class CoRegistrar:
         """Combined fit() + transform_all()."""
         self.fit(layers, **fit_kwargs)
         return self.transform_all(layers)
+
+    def coverage_mask(self, max_gap_cells: float = 3.0, layers=None) -> np.ndarray:
+        """
+        Pixels where EVERY registered layer has real data nearby.
+
+        For layer k a pixel is covered when it lies inside the layer's extent and
+        its distance (in reference cells) to the nearest pixel with real data is
+        at most tolerance_k = max(max_gap_cells, 1.5 · s_k), where s_k is the
+        layer's typical sample spacing in cells:
+          - 1 for dense layers (real data on ≥ 50 % of the pixels in its extent);
+          - otherwise the median nearest-neighbour distance between its data
+            samples (see _sample_spacing_cells). Sparse point- or line-sampled
+            layers are therefore covered between their samples, whereas a gap
+            much wider than the sample spacing is not.
+        Pixels outside a layer's extent are never covered.
+
+        Parameters
+        ----------
+        max_gap_cells : minimum tolerance (cells) for every layer
+        layers        : iterable of layer names to combine (default: all layers
+                        registered by the last transform_all())
+
+        Returns
+        -------
+        bool ndarray (ny, nx) — True = covered by real data of every layer.
+        The per-layer tolerances are stored in self.coverage_tolerance.
+        """
+        if not self._fitted:
+            raise RuntimeError("Call .fit() first.")
+        if not self.masks:
+            raise RuntimeError("Call .transform_all() first.")
+        if not max_gap_cells >= 0:
+            raise ValueError("max_gap_cells must be non-negative.")
+        names = list(self.masks) if layers is None else list(layers)
+        if not names:
+            raise ValueError("No layers to combine.")
+        missing = [n for n in names if n not in self.masks]
+        if missing:
+            raise KeyError(f"Layers not registered by transform_all(): {missing}")
+
+        shape = (self.ref_ny, self.ref_nx)
+        covered = np.ones(shape, dtype=bool)
+        for name in names:
+            nodata = np.asarray(self.masks[name], dtype=bool)
+            outside = self.outside_masks.get(name)
+            outside = np.zeros(shape, dtype=bool) if outside is None else \
+                np.asarray(outside, dtype=bool)
+            data = ~nodata & ~outside
+            inside = ~outside
+            if not data.any():
+                self.coverage_tolerance[name] = float('nan')
+                covered[:] = False
+                continue
+            data_fraction = data.sum() / max(int(inside.sum()), 1)
+            spacing = 1.0 if data_fraction >= 0.5 else self._sample_spacing_cells(data)
+            tol = max(float(max_gap_cells), 1.5 * spacing)
+            self.coverage_tolerance[name] = tol
+            dist = distance_transform_edt(~data)
+            covered &= inside & (dist <= tol)
+        return covered
+
+    @classmethod
+    def _sample_spacing_cells(cls, data: np.ndarray) -> float:
+        """
+        Median nearest-neighbour distance (cells) between the data samples of a
+        sparse layer. A connected cluster (8-connectivity) of at most
+        SAMPLE_CLUSTER_MAX_PIXELS data pixels counts as one sample at its
+        centroid, so a coarse source node upsampled to a block of reference
+        pixels counts once; larger clusters contribute every pixel. At most
+        SPACING_MAX_POINTS samples (fixed seed) are queried against the full
+        k-d tree. Returns 1.0 when fewer than two samples exist.
+        """
+        lab, n = label(data, structure=np.ones((3, 3), dtype=bool))
+        if n == 0:
+            return 1.0
+        rows, cols = np.nonzero(data)
+        ids = lab[rows, cols]
+        size = np.bincount(ids, minlength=n + 1)
+        small = size <= cls.SAMPLE_CLUSTER_MAX_PIXELS
+        small[0] = False
+        cnt = np.maximum(size, 1)
+        cy = np.bincount(ids, weights=rows, minlength=n + 1) / cnt
+        cx = np.bincount(ids, weights=cols, minlength=n + 1) / cnt
+        keep = ~small[ids]
+        pts = np.vstack([
+            np.column_stack([cy[small], cx[small]]),
+            np.column_stack([rows[keep], cols[keep]]).astype(np.float64),
+        ])
+        if len(pts) < 2:
+            return 1.0
+        query = pts
+        if len(pts) > cls.SPACING_MAX_POINTS:
+            rng = np.random.default_rng(0)
+            query = pts[rng.choice(len(pts), cls.SPACING_MAX_POINTS, replace=False)]
+        d, _ = cKDTree(pts).query(query, k=2)
+        return max(1.0, float(np.median(d[:, 1])))
 
     def transform_points(
         self,
@@ -332,8 +475,143 @@ class CoRegistrar:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# GEOGRAPHIC (LON/LAT) GRIDS
+# ─────────────────────────────────────────────────────────────────────────────
+
+WGS84_A = 6378137.0          # semi-major axis (m)
+WGS84_E2 = 0.00669438        # first eccentricity squared
+
+# Common geographic EPSG codes, used when rasterio cannot classify a CRS
+_GEOGRAPHIC_EPSG = frozenset({
+    4019, 4148, 4152, 4167, 4171, 4230, 4258, 4267, 4269, 4277, 4283, 4314,
+    4322, 4326, 4612, 4617, 4674, 4686, 4759, 4979, 7844,
+})
+
+
+def _epsg_is_projected(code: int) -> bool:
+    """Common projected EPSG codes (UTM zones, Web Mercator) — fallback only."""
+    return (32601 <= code <= 32660 or 32701 <= code <= 32760 or
+            25828 <= code <= 25838 or 26901 <= code <= 26923 or
+            code in (3395, 3857, 900913))
+
+
+def _crs_is_geographic(crs):
+    """
+    Classifies a CRS: True (geographic), False (projected) or None (unknown).
+    Accepts CRS objects with an `is_geographic` attribute (rasterio, pyproj),
+    anything rasterio's CRS.from_user_input understands (when rasterio is
+    installed), and otherwise EPSG codes, PROJ strings and WKT text.
+    """
+    if crs is None:
+        return None
+    flag = getattr(crs, 'is_geographic', None)
+    if isinstance(flag, (bool, np.bool_)):
+        return bool(flag)
+    try:
+        from rasterio.crs import CRS
+        return bool(CRS.from_user_input(crs).is_geographic)
+    except Exception:
+        pass
+
+    text = crs.to_wkt() if hasattr(crs, 'to_wkt') else str(crs)
+    t = text.strip().upper()
+    if not t:
+        return None
+    # WKT (projected CRS definitions embed a GEOGCS, so test them first)
+    if re.search(r'\b(PROJCS|PROJCRS|PROJECTEDCRS)\s*\[', t):
+        return False
+    if re.search(r'\b(GEOGCS|GEOGCRS|GEOGRAPHICCRS)\s*\[', t):
+        return True
+    # PROJ strings
+    m = re.search(r'\+PROJ\s*=\s*([A-Z_]+)', t)
+    if m:
+        return m.group(1) in ('LONGLAT', 'LATLONG', 'LONLAT', 'LATLON')
+    # EPSG codes ('EPSG:4326', 'urn:ogc:def:crs:EPSG::4326', '4326')
+    m = re.search(r'EPSG\D{0,8}(\d{4,6})', t) or re.fullmatch(r'(\d{4,6})', t)
+    if m:
+        code = int(m.group(1))
+        if code in _GEOGRAPHIC_EPSG:
+            return True
+        if _epsg_is_projected(code):
+            return False
+        return None
+    if 'UTM' in t or 'MERCATOR' in t:          # incl. ER Mapper 'NUTM35', 'SUTM50'
+        return False
+    if t in ('CRS84', 'OGC:CRS84', 'WGS84', 'WGS 84', 'ETRS89', 'NAD83', 'NAD27',
+             'GEODETIC', 'GEOGRAPHIC', 'LATLONG', 'LONGLAT', 'LATLON', 'LONLAT'):
+        return True                               # 'GEODETIC' = ER Mapper lon/lat
+    return None
+
+
+def looks_geographic(x=None, y=None, crs=None) -> bool:
+    """
+    Do the coordinates appear to be longitude/latitude in degrees?
+
+    When `crs` (string, WKT, EPSG code, rasterio/pyproj CRS, ...) can be
+    classified it decides (e.g. 'EPSG:4326', '+proj=longlat', 'GEOGCS[...]' →
+    True; a projected CRS → False). Otherwise a heuristic on the coordinates is
+    used: |x| ≤ 180, |y| ≤ 90 and both spans ≤ 30 (degrees). Note that the
+    heuristic cannot tell a small local metric grid near the origin (spans
+    ≤ 30 units) from a lon/lat grid; pass the CRS whenever it is known.
+    """
+    flag = _crs_is_geographic(crs)
+    if flag is not None:
+        return flag
+    if x is None or y is None:
+        return False
+    x = np.asarray(x, dtype=np.float64).ravel()
+    y = np.asarray(y, dtype=np.float64).ravel()
+    x = x[np.isfinite(x)]
+    y = y[np.isfinite(y)]
+    if x.size == 0 or y.size == 0:
+        return False
+    return bool(np.abs(x).max() <= 180.0 and np.abs(y).max() <= 90.0 and
+                x.max() - x.min() <= 30.0 and y.max() - y.min() <= 30.0)
+
+
+def metric_cell_size(dx, dy, lat_deg) -> tuple:
+    """
+    Converts a geographic cell size (degrees) to metres at latitude `lat_deg`
+    on the WGS84 ellipsoid:
+      dy_m = dy · (111132.954 − 559.822·cos 2φ + 1.175·cos 4φ)        (meridian arc)
+      dx_m = dx · (π/180) · a·cos φ / sqrt(1 − e²·sin²φ)               (parallel arc)
+    with a = 6378137 m and e² = 0.00669438. Use the grid's central latitude and
+    pass the result to the filters / extract_features as dx, dy.
+    Returns (dx_m, dy_m); floats for scalar input, arrays otherwise.
+    """
+    lat = np.asarray(lat_deg, dtype=np.float64)
+    if np.any(~np.isfinite(lat)) or np.any(np.abs(lat) > 90.0):
+        raise ValueError("lat_deg must be a finite latitude in [-90, 90] degrees.")
+    phi = np.radians(lat)
+    m_per_deg_lat = 111132.954 - 559.822 * np.cos(2 * phi) + 1.175 * np.cos(4 * phi)
+    m_per_deg_lon = (np.pi / 180.0) * WGS84_A * np.cos(phi) / \
+        np.sqrt(1.0 - WGS84_E2 * np.sin(phi) ** 2)
+    dx_m = np.asarray(dx, dtype=np.float64) * m_per_deg_lon
+    dy_m = np.asarray(dy, dtype=np.float64) * m_per_deg_lat
+    if dx_m.ndim == 0 and dy_m.ndim == 0:
+        return float(dx_m), float(dy_m)
+    return dx_m, dy_m
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # FOURIER HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
+
+def _fit_plane(grid: np.ndarray) -> np.ndarray:
+    """
+    Least-squares first-order trend surface a + b·(j − j̄) + c·(i − ī) of a full
+    regular grid (float64). On a complete grid the three regressors are
+    orthogonal, so the coefficients have a closed form.
+    """
+    ny, nx = grid.shape
+    jc = np.arange(nx, dtype=np.float64) - 0.5 * (nx - 1)
+    ic = np.arange(ny, dtype=np.float64) - 0.5 * (ny - 1)
+    sxx, syy = float(jc @ jc), float(ic @ ic)
+    a = float(grid.mean())
+    b = float(grid.mean(axis=0) @ jc) / sxx if sxx > 0 else 0.0
+    c = float(grid.mean(axis=1) @ ic) / syy if syy > 0 else 0.0
+    return a + b * jc[None, :] + c * ic[:, None]
+
 
 def _cosine_taper(n_data: int, pad: int) -> np.ndarray:
     """Window that is 1 over the data region and tapers to 0 with a cosine over the padded edges."""
@@ -346,36 +624,55 @@ def _cosine_taper(n_data: int, pad: int) -> np.ndarray:
 
 
 def _fourier_filter(grid: np.ndarray, dx: float, dy: float, response,
-                    pad_fraction: float = 0.25, keep_mean: bool = False) -> np.ndarray:
+                    pad_fraction: float = 0.25, keep_mean: bool = False,
+                    directional: bool = False, trend_gain: float = None) -> np.ndarray:
     """
-    Applies a filter in the wavenumber domain: IFFT(H(|k|) · FFT(grid)).
+    Applies a filter in the wavenumber domain: IFFT(H(k) · FFT(grid)).
 
-    To reduce edge effects: the mean is removed, mirror (reflect) padding of
-    pad_fraction is added to each edge, and the padded region is tapered to
-    zero with a cosine window (periodic continuity).
-    response: function that takes an array of |k| (rad/unit) and returns H.
+    To reduce edge effects, a least-squares first-order trend surface (plane)
+    is removed first, the residual is mirror (reflect) padded by pad_fraction
+    on each edge, and the padded region is tapered to zero with a cosine window
+    (periodic continuity). Removing only the mean is not enough: reflect
+    padding turns a regional gradient into a triangle wave whose slope breaks
+    leak into every wavenumber (e.g. a non-zero vertical derivative of a plane).
+
+    response    : directional=False → function of |k| (rad/unit) returning H;
+                  directional=True  → function H(kx, ky, k) of the wavenumber
+                  vector (kx along axis 1 / x, ky along axis 0 / y, numpy FFT
+                  sign convention; kx, ky are broadcastable 2D arrays). It must
+                  be Hermitian, H(−k) = conj(H(k)), as for any real filter.
+    keep_mean   : add the removed plane back multiplied by H(0) (|k| responses
+                  only). A plane is harmonic: upward continuation (H(0) = 1)
+                  leaves it unchanged, vertical derivatives (H(0) = 0) remove it.
+    trend_gain  : explicit factor for adding the plane back; overrides keep_mean.
     """
     grid = np.asarray(grid, dtype=np.float64)
     if not np.all(np.isfinite(grid)):
         raise ValueError("Fourier filter requires a grid without NaN values.")
     ny, nx = grid.shape
-    mean = float(grid.mean())
-    g = grid - mean
+    trend = _fit_plane(grid)
+    g = grid - trend
 
     py = int(np.ceil(ny * pad_fraction))
     px = int(np.ceil(nx * pad_fraction))
     padded = np.pad(g, ((py, py), (px, px)), mode='reflect')
-    padded *= np.outer(_cosine_taper(ny, py), _cosine_taper(nx, px))
+    padded *= _cosine_taper(ny, py)[:, None]
+    padded *= _cosine_taper(nx, px)[None, :]
 
     NY, NX = padded.shape
     ky = 2 * np.pi * np.fft.fftfreq(NY, d=dy)
+    # Half spectrum along x: real input and Hermitian responses, H(−k) = conj(H(k)),
+    # so the real FFT gives the same result as the full complex one
     kx = 2 * np.pi * np.fft.rfftfreq(NX, d=dx)
     K = np.sqrt(kx[None, :] ** 2 + ky[:, None] ** 2)
-
     spec = np.fft.rfft2(padded)
-    out = np.fft.irfft2(spec * response(K), s=padded.shape)[py:py + ny, px:px + nx]
-    if keep_mean:
-        out = out + mean * float(response(np.zeros(1))[0])
+    H = response(kx[None, :], ky[:, None], K) if directional else response(K)
+    out = np.fft.irfft2(spec * H, s=padded.shape)[py:py + ny, px:px + nx]
+
+    if trend_gain is None:
+        trend_gain = float(response(np.zeros(1))[0]) if (keep_mean and not directional) else 0.0
+    if trend_gain != 0.0:
+        out = out + trend_gain * trend
     return out
 
 
@@ -387,13 +684,19 @@ class GeophysicalFilters:
     """
     Filters that extract anomaly and structural information from geophysical data.
     All methods take a NaN-free 2D numpy array of shape (ny, nx) and return an
-    array of the same shape. dx, dy: cell size (coordinate units, e.g. m).
+    array of the same shape. dx, dy: cell size in the same length unit on both
+    axes (e.g. m). Grid rows are ascending y (row 0 = south), columns ascending
+    x (east). For a lon/lat grid convert the cell size first with
+    metric_cell_size(); degrees are not equal lengths on both axes.
 
     Vertical derivatives are computed in the wavenumber domain according to
     potential-field theory (z positive down):  ∂F/∂z = F⁻¹[ |k| · F(k) ],
     upward continuation:                       F_h  = F⁻¹[ e^{-|k|h} · F(k) ].
     Hence the horizontal and vertical derivatives share the same units (e.g. nT/m)
     and the analytic signal / tilt angle are physically consistent.
+    A least-squares plane (regional gradient) is removed before the FFT; being
+    harmonic, it is added back unchanged by upward continuation and reduction to
+    the pole, and contributes nothing to the vertical derivatives.
     """
 
     @staticmethod
@@ -437,6 +740,75 @@ class GeophysicalFilters:
             raise ValueError("height cannot be negative (downward continuation is not supported).")
         h = float(height)
         return _fourier_filter(grid, dx, dy, lambda K: np.exp(-K * h), keep_mean=True)
+
+    @staticmethod
+    def reduce_to_pole(grid: np.ndarray, dx: float, dy: float,
+                       inclination: float, declination: float,
+                       mag_inclination: float = None, mag_declination: float = None,
+                       epsilon: float = 1e-3) -> np.ndarray:
+        """
+        Reduction to the pole (RTP) of total-magnetic-intensity data: the field
+        that the same sources would produce with vertical magnetisation in a
+        vertical inducing field, so anomalies sit over their sources.
+
+            Θ(k) = sin I + i·(cos I·sin D·k_x + cos I·cos D·k_y) / |k|
+            H(k) = conj(Θ_f·Θ_m) / (|Θ_f·Θ_m|² + ε²),   H(0) = 0
+
+        with x = east (axis 1), y = north (axis 0, rows ascending northwards),
+        z positive down, Θ_f from the geomagnetic field direction and Θ_m from
+        the magnetisation direction (defaults to the field direction, i.e. purely
+        induced magnetisation). ε regularises directions where Θ vanishes.
+        The least-squares plane removed before the FFT is added back unchanged.
+
+        Parameters
+        ----------
+        inclination, declination         : geomagnetic field direction (degrees;
+                                           inclination positive down, declination
+                                           clockwise from north)
+        mag_inclination, mag_declination : magnetisation direction (degrees)
+        epsilon                          : regularisation (dimensionless)
+
+        RTP is unstable at low magnetic latitudes; a UserWarning is issued when
+        |inclination| (or the magnetisation inclination) is below 15°.
+        """
+        inc, dec = float(inclination), float(declination)
+        m_inc = inc if mag_inclination is None else float(mag_inclination)
+        m_dec = dec if mag_declination is None else float(mag_declination)
+        eps = float(epsilon)
+        if not np.isfinite([inc, dec, m_inc, m_dec]).all():
+            raise ValueError("Field and magnetisation directions must be finite.")
+        if not eps >= 0:
+            raise ValueError("epsilon must be non-negative.")
+        if abs(inc) < 15.0 or abs(m_inc) < 15.0:
+            warnings.warn(
+                f"Reduction to the pole at low inclination (field {inc:.1f}°, "
+                f"magnetisation {m_inc:.1f}°) is unstable; amplitudes along the "
+                "declination direction are strongly amplified.", UserWarning,
+            )
+
+        def direction(i_deg, d_deg):
+            i, d = np.radians(i_deg), np.radians(d_deg)
+            return np.sin(i), np.cos(i) * np.sin(d), np.cos(i) * np.cos(d)
+
+        sf, ef, nf = direction(inc, dec)
+        sm, em, nm = direction(m_inc, m_dec)
+
+        def response(kx, ky, k):
+            # Θ_f = sf + i·bf, Θ_m = sm + i·bm; t = Θ_f·Θ_m = re + i·im
+            k_safe = np.where(k > 0, k, 1.0)
+            bf = (ef * kx + nf * ky) / k_safe
+            bm = (em * kx + nm * ky) / k_safe
+            re = sf * sm - bf * bm
+            im = sf * bm + sm * bf
+            den = re * re + im * im + eps * eps
+            den[den <= 0] = np.inf                   # Θ = 0 with ε = 0 → H = 0
+            h = np.empty(den.shape, dtype=np.complex128)
+            h.real = re / den
+            h.imag = -im / den
+            h[k == 0] = 0.0
+            return h
+
+        return _fourier_filter(grid, dx, dy, response, directional=True, trend_gain=1.0)
 
     @staticmethod
     def analytic_signal(grid: np.ndarray, dx: float = 1.0, dy: float = 1.0,
@@ -533,20 +905,28 @@ LAYER_FILTER_PROFILES = {
     'default':       ['raw', 'smooth', 'hgrad', 'stats'],
 }
 
-# Detection priority and keywords. Short keywords (≤4 letters) match only as
-# whole tokens; longer ones are also searched as substrings of the name.
+# Detection priority and keywords. The name is split into tokens at every
+# non-alphanumeric character. Detection runs in three passes:
+#   1. whole-token matches across all types (first type in priority order wins);
+#   2. only if no token matched: keywords of ≥ 5 letters searched as substrings,
+#      longest first; a matched keyword hides the shorter ones it contains, so
+#      'electromagnetic' (conductivity) is not also read as 'magnetic';
+#   3. only if nothing else matched: the weak tokens in LAYER_TYPE_WEAK_TOKENS
+#      ('res' usually abbreviates 'residual': 'cu_res' is geochemistry,
+#      'dem_res' topography, but a bare 'dipole_dipole_res' is resistivity).
 # Turkish aliases ('manyetik', 'gravite', 'rezistivite', 'iletkenlik', 'radyometrik',
 # 'sismik', 'yukselti', 'jeoloji', 'jeokimya') are kept to match user data.
 LAYER_TYPE_KEYWORDS = [
-    ('ip',           ['ip', 'chargeability', 'charg', 'chg', 'polarization',
+    ('ip',           ['ip', 'chargeability', 'chg', 'polarization',
                       'polarisation']),
-    ('magnetic',     ['magnetic', 'magnetics', 'aeromag', 'mag', 'tmi', 'rtp',
-                      'manyetik']),
+    ('magnetic',     ['magnetic', 'magnetics', 'aeromag', 'aeromagnetic',
+                      'aeromagnetics', 'mag', 'tmi', 'rtp', 'manyetik']),
     ('gravity',      ['gravity', 'grav', 'bouguer', 'cba', 'faa', 'freeair',
                       'isostatic', 'gravite']),
-    ('resistivity',  ['resistivity', 'res', 'rho', 'ohm', 'ohmm', 'rezistivite',
-                      'ert']),
-    ('conductivity', ['conductivity', 'conductance', 'cond', 'em', 'tem', 'aem',
+    ('resistivity',  ['resistivity', 'rho', 'ohm', 'ohmm', 'rezistivite',
+                      'ert', 'magnetotelluric', 'magnetotellurics', 'csamt']),
+    ('conductivity', ['conductivity', 'conductance', 'cond', 'electromagnetic',
+                      'electromagnetics', 'em', 'tem', 'aem', 'hem', 'fdem', 'tdem',
                       'iletkenlik']),
     ('radiometric',  ['radiometric', 'radiometrics', 'gamma', 'potassium',
                       'thorium', 'uranium', 'spectrometry', 'radyometrik']),
@@ -560,15 +940,46 @@ LAYER_TYPE_KEYWORDS = [
                       'sn', 'li', 'bi', 'te', 'ba', 'sr', 'cl']),
 ]
 
+# Ambiguous tokens, used only when no other keyword matches (pass 3)
+LAYER_TYPE_WEAK_TOKENS = [
+    ('resistivity', ['res']),
+]
+
 
 def detect_layer_type(name: str) -> str:
-    """Infers the layer type from its name (e.g. 'mag_rtp' → 'magnetic')."""
+    """
+    Infers the layer type from its name (e.g. 'mag_rtp' → 'magnetic',
+    'aem_electromagnetic' → 'conductivity', 'cu_res' → 'geochemistry').
+    See LAYER_TYPE_KEYWORDS for the matching rules.
+    """
     lower = str(name).lower()
-    tokens = [t for t in re.split(r'[^0-9a-z]+', lower) if t]
+    tokens = {t for t in re.split(r'[^0-9a-z]+', lower) if t}
+
+    # 1. Whole tokens, in type priority order
     for typ, keywords in LAYER_TYPE_KEYWORDS:
-        for kw in keywords:
-            if kw in tokens or (len(kw) >= 5 and kw in lower):
-                return typ
+        if any(kw in tokens for kw in keywords):
+            return typ
+
+    # 2. Long keywords as substrings; longest first, each match is blanked out
+    long_kws = sorted(
+        ((kw, prio, typ) for prio, (typ, keywords) in enumerate(LAYER_TYPE_KEYWORDS)
+         for kw in keywords if len(kw) >= 5),
+        key=lambda item: (-len(item[0]), item[1]),
+    )
+    text = lower
+    found = set()
+    for kw, _, typ in long_kws:
+        if kw in text:
+            found.add(typ)
+            text = text.replace(kw, ' ')
+    for typ, _ in LAYER_TYPE_KEYWORDS:
+        if typ in found:
+            return typ
+
+    # 3. Weak tokens
+    for typ, keywords in LAYER_TYPE_WEAK_TOKENS:
+        if any(kw in tokens for kw in keywords):
+            return typ
     return 'default'
 
 
@@ -590,6 +1001,47 @@ def feature_layer_type(feature_name: str) -> str:
 # FEATURE ENGINEERING
 # ─────────────────────────────────────────────────────────────────────────────
 
+# Filters understood by extract_features (profile entries)
+KNOWN_FILTERS = ('raw', 'smooth', 'residual', 'hgrad', 'analytic_signal', 'tilt',
+                 'upward', 'fvd', 'rtp', 'log', 'stats')
+
+
+def _check_magnetic_field(magnetic_field):
+    """Validates the magnetic_field argument of extract_features (None passes through)."""
+    if magnetic_field is None:
+        return None
+    if not isinstance(magnetic_field, Mapping) or \
+            'inclination' not in magnetic_field or 'declination' not in magnetic_field:
+        raise ValueError(
+            "magnetic_field must be a dict with 'inclination' and 'declination' "
+            "(degrees) and optionally 'mag_inclination', 'mag_declination', 'epsilon'."
+        )
+    out = {'inclination': float(magnetic_field['inclination']),
+           'declination': float(magnetic_field['declination'])}
+    for key in ('mag_inclination', 'mag_declination', 'epsilon'):
+        if magnetic_field.get(key) is not None:
+            out[key] = float(magnetic_field[key])
+    return out
+
+
+def _log_feature(g: np.ndarray) -> np.ndarray:
+    """
+    Unit-independent log transform for log-normally distributed data:
+      strictly positive layer → log10(x)
+      otherwise               → sign(x)·log1p(|x| / s),  s = median(|x|) over x ≠ 0
+    Rescaling the data (ppm ↔ ppb, S/m ↔ mS/m) only shifts the first form by a
+    constant and leaves the second unchanged.
+    """
+    if np.all(g > 0):
+        return np.log10(g)
+    a = np.abs(g)
+    nonzero = a[a > 0]
+    s = float(np.median(nonzero)) if nonzero.size else 1.0
+    if not (np.isfinite(s) and s > 0):
+        s = 1.0
+    return np.sign(g) * np.log1p(a / s)
+
+
 def extract_features(
     registered_layers: dict,
     window_size: int = 5,
@@ -599,6 +1051,8 @@ def extract_features(
     profiles: dict = None,
     upward_height_cells: float = 3.0,
     derivative_stabilize_cells: float = 1.0,
+    magnetic_field: dict = None,
+    return_offsets: bool = False,
 ) -> tuple:
     """
     Produces feature maps from co-registered grids.
@@ -607,28 +1061,65 @@ def extract_features(
     ----------
     registered_layers : {name: 2D ndarray}
     window_size       : Statistics window size (pixels)
-    dx, dy            : Pixel size (coordinate units)
-    profiles          : {layer_name: [filter,...]} — overrides the automatic profile
+    dx, dy            : Pixel size in metres (or another common length unit);
+                        convert lon/lat cell sizes with metric_cell_size() first
+    profiles          : {layer_name: [filter,...]} — overrides the automatic
+                        profile (used verbatim). Filters: KNOWN_FILTERS.
     upward_height_cells        : height of the 'upward' filter (number of cells)
     derivative_stabilize_cells : stabilization height for the vertical derivatives (number of cells)
+    magnetic_field    : None or {'inclination': I, 'declination': D (degrees),
+                        optional 'mag_inclination', 'mag_declination',
+                        'epsilon'}. When given, the automatic profile of every
+                        magnetic layer gets an extra reduced-to-pole feature
+                        '<layer>__rtp' (GeophysicalFilters.reduce_to_pole); the
+                        'rtp' filter requires it.
+    return_offsets    : if True, also return {layer: offset} (see below)
+
+    Level-carrying features (raw, smooth, upward, rtp, win_mean) are computed
+    from the layer minus its median (offset, float64) so that small anomalies
+    on a large absolute level (e.g. observed gravity ≈ 979 800 mGal) survive the
+    cast to float32; add offsets[layer] back to recover absolute levels. All
+    other features are offset independent.
 
     Returns
     -------
-    (feature_stack, feature_names, feature_maps)
+    (feature_stack, feature_names, feature_maps[, offsets])
     feature_stack : (ny, nx, n_features) float32 ndarray
     feature_names : list of str  ('<layer>__<filter>')
     feature_maps  : {feature_name: 2D float32 ndarray}
+    offsets       : {layer_name: float} — only if return_offsets=True
     """
     F = GeophysicalFilters()
+    field = _check_magnetic_field(magnetic_field)
+    rtp_kwargs = {} if field is None else dict(field)
     feature_maps = {}
+    offsets = {}
     cell = 0.5 * (abs(dx) + abs(dy))
     h_up = upward_height_cells * cell
     h_st = derivative_stabilize_cells * cell
 
+    # Resolve and validate every profile before any computation
+    plan = []
     for layer_name, grid in registered_layers.items():
         typ = detect_layer_type(layer_name)
-        profile = (profiles or {}).get(layer_name) or \
-            LAYER_FILTER_PROFILES.get(typ, LAYER_FILTER_PROFILES['default'])
+        custom = (profiles or {}).get(layer_name)
+        if custom:
+            profile = list(custom)
+        else:
+            profile = list(LAYER_FILTER_PROFILES.get(typ, LAYER_FILTER_PROFILES['default']))
+            if field is not None and typ == 'magnetic' and 'rtp' not in profile:
+                profile.append('rtp')
+        for filt in profile:
+            if filt not in KNOWN_FILTERS:
+                raise ValueError(f"Unknown filter: '{filt}' (layer {layer_name})")
+            if filt == 'rtp' and field is None:
+                raise ValueError(
+                    f"Filter 'rtp' (layer {layer_name}) requires magnetic_field="
+                    "{'inclination': ..., 'declination': ...}."
+                )
+        plan.append((layer_name, grid, typ, profile))
+
+    for layer_name, grid, typ, profile in plan:
         if verbose:
             print(f"    Extracting features: {layer_name} [{typ}]")
 
@@ -638,37 +1129,39 @@ def extract_features(
                 warnings.warn(f"Layer '{layer_name}' is entirely empty, skipping.", UserWarning)
                 continue
             g = fill_nans(g, method='nearest')
+        offset = float(np.median(g))
+        offsets[layer_name] = offset
+        g0 = g - offset
 
         for filt in profile:
             key = f"{layer_name}__{filt}"
 
             if filt == 'raw':
-                feature_maps[key] = g
+                feature_maps[key] = g0
             elif filt == 'smooth':
-                feature_maps[key] = gaussian_filter(g, sigma=1.5)
+                feature_maps[key] = gaussian_filter(g0, sigma=1.5)
             elif filt == 'residual':
-                _, res = F.regional_residual(g)
+                _, res = F.regional_residual(g0)
                 feature_maps[key] = res
             elif filt == 'hgrad':
-                feature_maps[key] = F.horizontal_gradient(g, dx, dy)
+                feature_maps[key] = F.horizontal_gradient(g0, dx, dy)
             elif filt == 'analytic_signal':
-                feature_maps[key] = F.analytic_signal(g, dx, dy, h_st)
+                feature_maps[key] = F.analytic_signal(g0, dx, dy, h_st)
             elif filt == 'tilt':
-                feature_maps[key] = F.tilt_angle(g, dx, dy, h_st)
+                feature_maps[key] = F.tilt_angle(g0, dx, dy, h_st)
             elif filt == 'upward':
-                feature_maps[key] = F.upward_continuation(g, dx, dy, h_up)
+                feature_maps[key] = F.upward_continuation(g0, dx, dy, h_up)
             elif filt == 'fvd':
-                feature_maps[key] = F.first_vertical_derivative(g, dx, dy, h_st)
+                feature_maps[key] = F.first_vertical_derivative(g0, dx, dy, h_st)
+            elif filt == 'rtp':
+                feature_maps[key] = F.reduce_to_pole(g0, dx, dy, **rtp_kwargs)
             elif filt == 'log':
-                # Signed log transform: S = sign(F)·log(1+|F|)
-                feature_maps[key] = np.sign(g) * np.log1p(np.abs(g))
+                feature_maps[key] = _log_feature(g)
             elif filt == 'stats':
-                m, s, r = F.stat_window(g, window=window_size)
+                m, s, r = F.stat_window(g0, window=window_size)
                 feature_maps[f"{layer_name}__win_mean"] = m
                 feature_maps[f"{layer_name}__win_std"] = s
                 feature_maps[f"{layer_name}__win_range"] = r
-            else:
-                raise ValueError(f"Unknown filter: '{filt}' (layer {layer_name})")
 
     if not feature_maps:
         raise ValueError("No features could be produced.")
@@ -684,6 +1177,8 @@ def extract_features(
         print(f"  ✓ Total {len(feature_names)} feature maps | "
               f"Grid: {ny}×{nx}")
 
+    if return_offsets:
+        return feature_stack, feature_names, feature_maps, offsets
     return feature_stack, feature_names, feature_maps
 
 
@@ -693,24 +1188,44 @@ def extract_features(
 
 class RobustGridNormalizer:
     """
-    Robust per-feature normalization (median / IQR based):
-      1. Percentile clipping  x ← clip(x, q(α), q(1-α))
-      2. z = (x − median) / IQR    (std if IQR≈0; 1 if that is also ≈0)
-      3. Global clipping  z ← clip(z, −5, 5)
-    More robust to outliers than StandardScaler. NaN values are preserved.
+    Robust per-feature normalization (median / IQR based), computed in float64:
+      1. z = (x − median) / scale,  scale = IQR; for degenerate features the
+         fallbacks are std → (max − min) → 1
+      2. Soft bound  z ← z_clip · tanh(z / z_clip)
+    The soft bound is ≈ identity for |z| ≪ z_clip, strictly monotonic and never
+    exceeds ±z_clip. No hard percentile clip is applied, so anomalies covering
+    well under 2 % of the map keep their contrast and ordering, and binary /
+    indicator features keep two distinct values. (In float32, values more than
+    ≈ 8·z_clip robust units from the median approach ±z_clip within rounding.)
+    NaN values are preserved. The output is float32.
     """
 
-    def __init__(self, clip_percentile: float = 2.0, z_clip: float = 5.0):
-        """clip_percentile: percentage clipped at each tail."""
+    def __init__(self, clip_percentile: float = None, z_clip: float = 5.0):
+        """
+        clip_percentile : deprecated and ignored (formerly the percentage
+                          hard-clipped at each tail before scaling)
+        z_clip          : soft bound of the normalized values (None = no bound)
+        """
+        if clip_percentile is not None:
+            warnings.warn(
+                "RobustGridNormalizer(clip_percentile=...) is deprecated and ignored; "
+                "outliers are bounded softly by z_clip·tanh(z / z_clip).",
+                DeprecationWarning, stacklevel=2,
+            )
+        if z_clip is not None and not z_clip > 0:
+            raise ValueError("z_clip must be positive (or None for no bound).")
         self.clip_percentile = clip_percentile
         self.z_clip = z_clip
-        self.params = {}  # {feature_idx: (p_low, p_high, median, scale)}
+        # {feature_idx: (low, high, median, scale)}; low/high are hard bounds
+        # kept for backward compatibility and are always (-inf, inf) now
+        self.params = {}
         self._fitted = False
 
     def fit(self, feature_stack: np.ndarray):
         """
         feature_stack: (ny, nx, n_features) or (n_samples, n_features)
         """
+        feature_stack = np.asarray(feature_stack)
         nf = feature_stack.shape[-1]
         X = feature_stack.reshape(-1, nf)
 
@@ -721,40 +1236,47 @@ class RobustGridNormalizer:
             if len(valid) < 10:
                 self.params[i] = (-np.inf, np.inf, 0.0, 1.0)
                 continue
-            p_low, q25, median, q75, p_high = np.percentile(
-                valid, [self.clip_percentile, 25, 50, 75, 100 - self.clip_percentile]
-            )
-            scale = q75 - q25
-            if not scale > 1e-12 * max(1.0, abs(median)):
-                clipped = np.clip(valid, p_low, p_high)
-                scale = float(np.std(clipped))
-                if not scale > 1e-12 * max(1.0, abs(median)):
-                    scale = 1.0
-            self.params[i] = (float(p_low), float(p_high), float(median), float(scale))
+            q25, median, q75 = np.percentile(valid, [25, 50, 75])
+            tiny = 1e-12 * max(1.0, abs(float(median)))
+            scale = float(q75 - q25)
+            if not scale > tiny:
+                scale = float(np.std(valid))
+            if not scale > tiny:
+                scale = float(valid.max() - valid.min())
+            if not scale > tiny:
+                scale = 1.0
+            self.params[i] = (-np.inf, np.inf, float(median), scale)
 
         self._fitted = True
         return self
 
     def transform(self, feature_stack: np.ndarray) -> np.ndarray:
-        """Normalizes and clips to the range [−z_clip, z_clip]."""
+        """Normalizes (float64) and bounds softly to (−z_clip, z_clip); returns float32."""
         if not self._fitted:
             raise RuntimeError("Call .fit() first.")
 
+        feature_stack = np.asarray(feature_stack)
         input_shape = feature_stack.shape
         nf = input_shape[-1]
         if nf != len(self.params):
             raise ValueError(
                 f"Feature count mismatch: fit={len(self.params)}, transform={nf}"
             )
-        X = feature_stack.reshape(-1, nf).astype(np.float32, copy=True)
+        X = feature_stack.reshape(-1, nf)
+        out = np.empty(X.shape, dtype=np.float32)
+        zc = self.z_clip
 
         for i in range(nf):
-            p_low, p_high, median, scale = self.params[i]
-            col = np.clip(X[:, i], p_low, p_high)
-            X[:, i] = (col - median) / scale
+            low, high, median, scale = self.params[i]
+            col = X[:, i].astype(np.float64)
+            if np.isfinite(low) or np.isfinite(high):
+                col = np.clip(col, low, high)
+            z = (col - median) / scale
+            if zc is not None:
+                z = zc * np.tanh(z / zc)
+            out[:, i] = z
 
-        X = np.clip(X, -self.z_clip, self.z_clip)
-        return X.reshape(input_shape)
+        return out.reshape(input_shape)
 
     def fit_transform(self, feature_stack: np.ndarray) -> np.ndarray:
         return self.fit(feature_stack).transform(feature_stack)

@@ -309,7 +309,10 @@ def test_ers_reader_bil_bands_byteorder_and_registration(tmp_path):
     # registration at the cell centre (0.5): the first cell centre is exactly (1000, 2030)
     np.testing.assert_allclose(lyr['x'], [1000, 1010, 1020])
     np.testing.assert_allclose(lyr['y'], [2010, 2030])
-    assert lyr['crs'] == 'SUTM35'
+    # The ER Mapper code is resolved to a real CRS (GDAL, or the built-in WGS84 UTM
+    # mapping without rasterio); the raw code is kept separately.
+    assert lyr['crs'] == 'EPSG:32735'
+    assert lyr['ers_projection'] == 'SUTM35'
     lyr2 = L.load_grid(str(tmp_path / 'r.ers'), band=2)
     np.testing.assert_allclose(lyr2['grid'], band2[::-1])
 
