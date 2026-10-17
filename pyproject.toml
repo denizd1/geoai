@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "geoai"
-version = "3.2.0"
+version = "4.0.0"
 description = "Geophysical AI target detection: multi-layer fusion, prospectivity modeling and ranked drill targets"
 readme = "README.md"
 requires-python = ">=3.9"

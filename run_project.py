@@ -64,12 +64,17 @@ XYZ_COLUMNS = {
 }
 
 # Well / drillhole data (CSV)
-# Required columns: X (or Easting), Y (or Northing), LABEL (1=positive, 0=negative)
-# If a single file has a TARGET_TYPE column, only the matching rows are used for
-# each target type (you can pass the same file for several types).
+# Required columns: X (or Easting), Y (or Northing), LABEL (1/yes = positive,
+# 0/no = negative). If a single file has a TARGET_TYPE column, only the matching
+# rows are used for each target type (you can pass the same file for several types).
 WELL_FILES = {
     # 'mineral': 'data/wells_mineral.csv',
     # 'groundwater': 'data/wells_water.csv',
+}
+
+# Column names of the well files (if they are not detected automatically)
+WELL_COLUMNS = {
+    # 'mineral': {'x_col': 'EASTING', 'y_col': 'NORTHING', 'label_col': 'RESULT'},
 }
 
 # Grid resolution — large area + high resolution = slow
@@ -78,11 +83,22 @@ WELL_FILES = {
 GRID_NX = 300
 GRID_NY = 300
 
+# Valid area: gaps in a layer up to this many cells are bridged; larger survey
+# gaps are not predicted and cannot hold targets
+MAX_GAP_CELLS = 3.0
+
+# Main geomagnetic field at the survey (adds a reduced-to-pole magnetic feature),
+# e.g. {'inclination': 55.0, 'declination': 5.0}; None = no RTP feature
+MAGNETIC_FIELD = None
+
 # Target extraction and output settings
 MIN_PROBABILITY = None       # None = optimal threshold found by cross-validation
-UNCERTAINTY_PENALTY = 0.3    # λ in the confidence score S = P − λ·U
-EXPORT_GRIDS = True          # write the P/U/S maps as Surfer GRD + GeoTIFF
+UNCERTAINTY_PENALTY = 0.3    # λ in the confidence score S = P − λ·U (0 … 1)
+EXPORT_GRIDS = True          # write the P/U/S maps as grid files
+GRID_FORMATS = ("grd", "tif")  # also 'surfer7', 'geosoft', 'asc'
 SAVE_MODELS = False          # save trained models as output/models/*.joblib
+SAVE_PIPELINE = None         # e.g. "output/model.joblib" → reuse on a new area with
+                             # GeoAIPipeline.load(...).predict_area() or `geoai apply`
 SHOW_PLOTS = True
 
 # ══════════════════════════════════════════════════════════════
@@ -128,7 +144,7 @@ if __name__ == "__main__":
     if WELL_FILES:
         print("\nLoading well data...")
         for target_type, path in WELL_FILES.items():
-            pipe.add_wells(path, target_type=target_type)
+            pipe.add_wells(path, target_type=target_type, **WELL_COLUMNS.get(target_type, {}))
 
     if pipe.load_errors:
         print("\nWARNING: some files could not be loaded:")
@@ -153,7 +169,12 @@ if __name__ == "__main__":
         save_plots=True,
         uncertainty_penalty=UNCERTAINTY_PENALTY,
         export_grids=EXPORT_GRIDS,
+        grid_formats=GRID_FORMATS,
         save_models=SAVE_MODELS,
+        max_gap_cells=MAX_GAP_CELLS,
+        magnetic_field=MAGNETIC_FIELD,
     )
+    if SAVE_PIPELINE:
+        pipe.save(SAVE_PIPELINE)
 
-    print_targets(results)
+    print_targets(results, geographic=pipe.geographic)

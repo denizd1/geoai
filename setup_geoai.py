@@ -226,27 +226,36 @@ def print_usage():
   4. COMMAND LINE (JSON configuration):
   ─────────────────────────────
   python -m geoai template project.json   # example configuration
-  python -m geoai run project.json
+  python -m geoai run project.json --save-model model.joblib
+  python -m geoai apply model.joblib block_b.json   # trained model → new area
   python -m geoai info data/magnetic.grd
+
+  5. REALISTIC EXAMPLES (synthetic survey deliverables):
+  ─────────────────────────────
+  python examples/01_porphyry_survey_from_files.py
+  python generate_test_data.py --scenario groundwater --survey --output-dir survey_gw
 
   Supported file formats:
     .grd   → Surfer ASCII / Binary 6 / Binary 7, Geosoft (Oasis Montaj),
-             GMT netCDF (via rasterio)
+             GMT netCDF (native netCDF-3 reader)
+    .nc    → netCDF-3 (COARDS / CF / legacy GMT)
     .tif   → GeoTIFF (rasterio; otherwise Pillow + GeoTIFF tags)
     .ers   → ER Mapper
     .asc   → ESRI ASCII Grid
-    .xyz / .csv / .dat / .txt → regular lattice or scattered points (interpolation)
+    .xyz / .csv / .dat / .txt → regular lattice, scattered points or
+             Geosoft XYZ flight lines (gridded by interpolation)
 
   Example well CSV:
     X,Y,LABEL,TARGET_TYPE
     312000,4012000,1,mineral    ← positive (mineralization/water found)
     320000,4018000,0,mineral    ← negative (dry/barren well)
+  LABEL may also be yes/no or true/false.
 """)
 
 
 if __name__ == "__main__":
     print("\n  ╔══════════════════════════════════╗")
-    print("  ║  GeoAI v3.2 — Setup Script       ║")
+    print("  ║  GeoAI v4.0 — Setup Script       ║")
     print("  ╚══════════════════════════════════╝\n")
 
     check_python_version()

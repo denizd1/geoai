@@ -39,10 +39,13 @@ if __name__ == "__main__":
         targets = res['targets']
         if targets:
             t = targets[0]
+            pri = t['priority'] if t.get('priority') is not None else '-'
             print(
-                f"  {target_type:12}: "
+                f"  {target_type:12} [{res['mode']}]: "
                 f"X={t['x']:.0f}  Y={t['y']:.0f}  "
                 f"P={t['max_probability']:.3f}  "
                 f"Area={t['area_km2']:.2f} km²  "
-                f"Priority={t['priority']}"
+                f"Priority={pri}"
             )
+    print("\nOpen the HTML report in output_demo/ for the full summary "
+          "(targets, CV metrics and figures).")
