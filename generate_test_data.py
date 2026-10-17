@@ -1,30 +1,29 @@
 """
-GeoAI — Gerçekçi Test Verisi Üreticisi
-========================================
-Basit Gaussian blob'lar değil; gerçek jeofizik fizik formülleri:
+GeoAI — Realistic Test Data Generator
+=====================================
+Physics-based potential-field forward models instead of simple Gaussian blobs:
 
-  Manyetik : Nokta dipol + yayılmış cisim formülleri
-             Inclination/declination etkisi
-             RTP (Reduced to Pole) yaklaşımı
+  Magnetic : TMI anomaly of a sphere with induced magnetization (equivalent dipole),
+             ΔT = (μ₀/4π)·m·[3(f̂·r̂)² − 1]/r³ — including inclination/declination effects
 
-  Gravite  : Bouguer plaka + küresel cisim formülleri
-             Yoğunluk kontrast modelleme
+  Gravity  : Formulas for a spherical body (point mass) and a finite-width 2D
+             horizontal prism (sedimentary basin); density-contrast modelling
 
-  Rezistivite: Çift katmanlı Wenner dizisi tepkisi
-               Düşük dirençli iletken zonu (kil/su/sülfür)
+  Resistivity: Empirical (elliptical-transition) apparent resistivity map over
+               a conductive body — low-resistivity zone (clay/water/sulphide)
 
-  IP       : Chargeability = sülfür mineralizasyon proxy'si
+  IP       : Chargeability = sulphide mineralization proxy (empirical)
 
-  Jeokimya : Metalik anomali + arka plan gürültüsü
-             Log-normal dağılım (gerçek jeokimya böyle dağılır)
+  Geochemistry: Metal anomaly + log-normal background
+                (real geochemical data are log-normally distributed)
 
-Gerçekçilik özellikleri:
-  - Birden fazla jeolojik yapı (fay, damar, intüzyon)
-  - Veri boşlukları (topoğrafya, izin yok, erişim kısıtı)
-  - Her katmanda farklı ölçüm gürültüsü
-  - Grid hizalama farklılıkları (co-registration testi)
-  - Farklı çözünürlükler (sismik vs. jeokimya)
-  - Gerçekçi kuyu dağılımı + dengesizlik senaryoları
+Realism features:
+  - Multiple geological structures (fault, vein, intrusion)
+  - Data gaps (topography, no access permit, access restrictions)
+  - Different measurement noise in each layer
+  - Grid alignment differences (co-registration test)
+  - Different resolutions (seismic vs. geochemistry)
+  - Realistic well distribution + class-imbalance scenarios
 """
 
 import numpy as np
@@ -35,9 +34,11 @@ from scipy.ndimage import gaussian_filter
 from scipy.interpolate import RegularGridInterpolator
 import warnings
 
+from geoai.io.writers import save_surfer_ascii_grd as _write_surfer_ascii
+
 
 # ─────────────────────────────────────────────────────────────────────────────
-# JEOFİZİK FİZİK FONKSİYONLARI
+# GEOPHYSICAL FORWARD-MODEL FUNCTIONS
 # ─────────────────────────────────────────────────────────────────────────────
 
 SCENARIO_TARGET_TYPE_MAP = {
@@ -47,94 +48,113 @@ SCENARIO_TARGET_TYPE_MAP = {
     'geothermal': 'geothermal',
 }
 
-def magnetic_dipole(X, Y, cx, cy, depth, magnetization,
-                    inclination_deg=60, declination_deg=10):
-    """
-    Manyetize küresel cismin yüzeyde yarattığı toplam manyetik alan (TMI).
+MU0_OVER_4PI = 1e-7  # μ₀/4π  [T·m/A]
 
-    Formül: T = (μ₀/4π) * m * [3(m̂·r̂)r̂ - m̂] / r³
-    Basitleştirilmiş: TMI = F * (2sin²I - cos²I·cos²(D-A)) / r³
-    
-    I: inclination, D: declination, m: magnetizasyon momenti
+
+def magnetic_dipole(X, Y, cx, cy, depth, magnetization,
+                    inclination_deg=60, declination_deg=10, radius=None):
     """
+    Total-field anomaly (TMI, nT) produced at the surface by a spherical body
+    with induced magnetization (equivalent dipole).
+
+    B  = (μ₀/4π) · [3(m·r̂)r̂ − m] / r³
+    ΔT = f̂·B = (μ₀/4π) · m · [3(f̂·r̂)² − 1] / r³      (m ∥ f̂, induced)
+
+    Coordinates: x east, y north, z down. Main-field direction
+    f̂ = (cos I · sin D, cos I · cos D, sin I); r = observation − source = (dx, dy, −depth).
+
+    Parameters
+    ----------
+    depth         : depth of the source centre (m, > 0)
+    magnetization : if radius is given, magnetization intensity M (A/m) → m = M·(4/3)πR³;
+                    if radius is None, the dipole moment m (A·m²) directly
+    radius        : sphere radius (m); must be smaller than depth
+    """
+    if depth <= 0:
+        raise ValueError("depth must be positive.")
+    if radius is not None:
+        if not 0 < radius < depth:
+            raise ValueError("radius must be between 0 and depth (sphere below the surface).")
+        moment = magnetization * (4.0 / 3.0) * np.pi * radius**3
+    else:
+        moment = magnetization
+
     inc = np.radians(inclination_deg)
     dec = np.radians(declination_deg)
+    f_hat = np.array([np.cos(inc) * np.sin(dec), np.cos(inc) * np.cos(dec), np.sin(inc)])
 
-    dx = X - cx
-    dy = Y - cy
-    r_horiz = np.sqrt(dx**2 + dy**2)
-    r = np.sqrt(r_horiz**2 + depth**2)
-    r = np.maximum(r, depth * 0.1)  # singülerlik engelle
+    rx = X - cx
+    ry = Y - cy
+    rz = -float(depth)
+    r = np.sqrt(rx**2 + ry**2 + rz**2)
+    cos_fr = (f_hat[0] * rx + f_hat[1] * ry + f_hat[2] * rz) / r
 
-    # Azimut açısı
-    azimuth = np.arctan2(dx, dy)
-
-    # Toplam alan yaklaşımı
-    # Dipol anomalisi: TMI = M * [2sin²I - cos²I*cos²(azimuth-D)] / r³
-    term1 = 2 * np.sin(inc)**2
-    term2 = np.cos(inc)**2 * np.cos(azimuth - dec)**2
-    tmi = magnetization * depth**3 * (term1 - term2) / r**5 * 1e9  # nT
-
-    return tmi
+    delta_t = MU0_OVER_4PI * moment * (3 * cos_fr**2 - 1) / r**3   # Tesla
+    return delta_t * 1e9  # nT
 
 
 def gravity_sphere(X, Y, cx, cy, depth, density_contrast, radius):
     """
-    Küresel cismin Bouguer yerçekimi anomalisi.
-    
-    Δg = (4/3)π G ρ r³ * depth / (r_horiz² + depth²)^(3/2)
-    G = 6.674e-11 m³/(kg·s²)
+    Bouguer gravity anomaly of a spherical body (mGal).
+
+    Δg = G · M · depth / (r_horiz² + depth²)^(3/2),   M = (4/3)π R³ Δρ
+    G = 6.674e-11 m³/(kg·s²). The sphere must lie entirely below the surface (R < depth).
     """
+    if not 0 < radius < depth:
+        raise ValueError("radius must be between 0 and depth (sphere below the surface).")
     G = 6.674e-11
     dx = X - cx
     dy = Y - cy
     r_horiz2 = dx**2 + dy**2
     r3 = (r_horiz2 + depth**2)**(3/2)
-    r3 = np.maximum(r3, (depth * 0.1)**3)
 
     volume = (4/3) * np.pi * radius**3
     mass = density_contrast * volume  # kg/m³ * m³ = kg
 
     dg = G * mass * depth / r3  # m/s²
-    return dg * 1e5  # mGal dönüşümü (1 mGal = 1e-5 m/s²)
+    return dg * 1e5  # convert to mGal (1 mGal = 1e-5 m/s²)
 
 
 def gravity_horizontal_slab(X, cx, half_width, depth_top, depth_bot, density_contrast):
     """
-    Yatay tabaka (slab) yerçekimi anomalisi — fay/sediman havzası için.
-    Talwani formülü basitleştirilmiş versiyonu.
+    Gravity anomaly of a finite-width horizontal slab (2D rectangular prism) —
+    for a sedimentary basin / alluvial fill.
 
-    Not: Bu implementasyon y doğrultusunda sonsuz kabul edilen 2D slab modelidir.
-    Bu nedenle Y/cy parametreleri modele etki etmez; bilinçli olarak arayüzden
-    çıkarılmıştır.
+    The body spans x ∈ [cx − b, cx + b], z ∈ [z₁, z₂] and is infinite in the y direction:
+        Δg(x) = 2Gρ ∫∫ z / ((x − x')² + z²) dx' dz
+              = 2Gρ [F(u_b, z) − F(u_a, z)]_{z₁}^{z₂}
+        F(u, z) = z·arctan(u/z) + (u/2)·ln(u² + z²),   u = edge_x − x
+    In the limit b → ∞ the Bouguer slab 2πGρ(z₂ − z₁) is recovered.
+
+    Note: since this is a 2D model, the Y coordinate has no effect on it.
     """
+    if not 0 < depth_top < depth_bot:
+        raise ValueError("Must satisfy 0 < depth_top < depth_bot.")
     G = 6.674e-11
-    dx = X - cx
 
-    # 2D tabaka anomalisi (y yönünde sonsuz uzanan tabaka)
-    def _layer_contribution(z):
-        r = np.sqrt(dx**2 + z**2)
-        r = np.maximum(r, 1.0)
-        return 2 * G * density_contrast * (
-            half_width * z / (half_width**2 + z**2) +
-            np.arctan(half_width / (np.abs(dx) + 1e-3))
-        )
+    def _F(u, z):
+        return z * np.arctan(u / z) + 0.5 * u * np.log(u**2 + z**2)
 
-    dg = _layer_contribution(depth_top) - _layer_contribution(depth_bot)
+    u_b = (cx + half_width) - X
+    u_a = (cx - half_width) - X
+    dg = 2 * G * density_contrast * (
+        (_F(u_b, depth_bot) - _F(u_b, depth_top)) -
+        (_F(u_a, depth_bot) - _F(u_a, depth_top))
+    )
     return dg * 1e5  # mGal
 
 
 def resistivity_conductive_body(X, Y, cx, cy, half_width_x, half_width_y,
                                   resistivity_body, resistivity_host):
     """
-    İletken cisim üzerindeki görünür rezistivite haritası (basitleştirilmiş).
-    Yüksek iletkenlikte (düşük direnç): su, kil, sülfür.
+    Apparent resistivity map over a conductive body (simplified).
+    High conductivity (low resistivity): water, clay, sulphide.
     """
     dx = (X - cx) / half_width_x
     dy = (Y - cy) / half_width_y
     dist_norm = np.sqrt(dx**2 + dy**2)
 
-    # Eliptik geçiş fonksiyonu
+    # Elliptical transition function
     factor = np.exp(-dist_norm**2)
     res = resistivity_host * (1 - factor) + resistivity_body * factor
     return np.maximum(res, resistivity_body * 0.5)
@@ -143,17 +163,17 @@ def resistivity_conductive_body(X, Y, cx, cy, half_width_x, half_width_y,
 def lognormal_geochemistry(X, Y, cx, cy, anomaly_value, background,
                              sigma_x, sigma_y, angle_deg=0, rng=None):
     """
-    Log-normal dağılımlı jeokimyasal anomali.
-    Gerçek jeokimya verisi log-normal dağılır (nadir = yüksek değer).
+    Log-normally distributed geochemical anomaly.
+    Real geochemical data are log-normally distributed (rare = high value).
     """
     angle = np.radians(angle_deg)
     dx = (X - cx) * np.cos(angle) + (Y - cy) * np.sin(angle)
     dy = -(X - cx) * np.sin(angle) + (Y - cy) * np.cos(angle)
 
-    # Anizotropik Gaussian
+    # Anisotropic Gaussian
     gauss = np.exp(-(dx**2 / (2 * sigma_x**2) + dy**2 / (2 * sigma_y**2)))
     
-    # Log-normal arka plan
+    # Log-normal background
     rng = rng if rng is not None else np.random
     bg_lognorm = np.exp(
         rng.standard_normal(X.shape) * 0.4 + np.log(max(background, 1e-9))
@@ -163,25 +183,25 @@ def lognormal_geochemistry(X, Y, cx, cy, anomaly_value, background,
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# GEOLOJİK YAPI SİMÜLATÖRLERİ
+# GEOLOGICAL STRUCTURE SIMULATORS
 # ─────────────────────────────────────────────────────────────────────────────
 
 def create_fault_zone(X, Y, x0, y0, angle_deg, width, throw):
     """
-    Fay zonu: bir tarafa yüksek, diğer tarafa alçak blok.
-    Rejistivite ve manyetik süreklilik kırar.
+    Fault zone: upthrown block on one side, downthrown block on the other.
+    Breaks resistivity and magnetic continuity.
     """
     angle = np.radians(angle_deg)
-    # Fay doğrultusuna dik mesafe
+    # Distance perpendicular to the fault strike
     dist = -(X - x0) * np.sin(angle) + (Y - y0) * np.cos(angle)
-    # Geçiş zonu
+    # Transition zone
     step = throw * np.tanh(dist / width)
     return step
 
 
 def create_intrusion(X, Y, cx, cy, rx, ry, angle_deg=0):
     """
-    Eliptik intüzyon maskesi (0=dışarı, 1=içeri).
+    Elliptical intrusion mask (0=outside, 1=inside).
     """
     angle = np.radians(angle_deg)
     dx = (X - cx) * np.cos(angle) + (Y - cy) * np.sin(angle)
@@ -191,7 +211,7 @@ def create_intrusion(X, Y, cx, cy, rx, ry, angle_deg=0):
 
 def create_data_gap(shape, gaps):
     """
-    Veri boşluğu maskesi — gerçek sahadaki gibi.
+    Data-gap mask — as in a real field survey.
     gaps: list of (cx, cy, radius) tuples
     """
     mask = np.ones(shape)
@@ -205,18 +225,18 @@ def create_data_gap(shape, gaps):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ANA SENARYO SINIFI
+# MAIN SCENARIO CLASS
 # ─────────────────────────────────────────────────────────────────────────────
 
 class RealisticGeoDataGenerator:
     """
-    Gerçekçi jeofizik test verisi üreticisi.
+    Realistic geophysical test data generator.
 
-    Senaryolar:
-      'porphyry_copper' : Porfiri bakır yatağı (manyetik + IP + jeokimya)
-      'epithermal_gold' : Epitermal altın (düşük sülfürasyon, rezistivite)
-      'groundwater'     : Yeraltı suyu akiferi (rezistivite + gravite)
-      'geothermal'      : Jeotermal sistem (rezistivite + gravite + manyetik)
+    Scenarios:
+      'porphyry_copper' : Porphyry copper deposit (magnetic + IP + geochemistry)
+      'epithermal_gold' : Epithermal gold (low sulphidation, resistivity)
+      'groundwater'     : Groundwater aquifer (resistivity + gravity)
+      'geothermal'      : Geothermal system (resistivity + gravity + magnetic)
     """
 
     SCENARIOS = ['porphyry_copper', 'epithermal_gold', 'groundwater', 'geothermal']
@@ -225,9 +245,9 @@ class RealisticGeoDataGenerator:
         self,
         nx: int = 500,
         ny: int = 500,
-        x_min: float = 400000,   # UTM metre (örn. Türkiye için tipik değerler)
+        x_min: float = 400000,   # UTM metres (e.g. typical values for Turkey)
         y_min: float = 4200000,
-        cell_size: float = 100,  # metre/piksel
+        cell_size: float = 100,  # metres/pixel
         scenario: str = 'porphyry_copper',
         seed: int = 42,
         layer_grid_variations: bool = True,
@@ -236,9 +256,9 @@ class RealisticGeoDataGenerator:
         max_alignment_offset_cells: int = 3,
     ):
         if nx < 2 or ny < 2:
-            raise ValueError("nx ve ny en az 2 olmalıdır.")
+            raise ValueError("nx and ny must be at least 2.")
         if cell_size <= 0:
-            raise ValueError("cell_size pozitif olmalıdır.")
+            raise ValueError("cell_size must be positive.")
 
         self.nx = nx
         self.ny = ny
@@ -251,19 +271,19 @@ class RealisticGeoDataGenerator:
         self.vary_layer_alignment = bool(vary_layer_alignment)
         self.max_alignment_offset_cells = int(max(0, max_alignment_offset_cells))
 
-        # Endpoint düzeltmesi: gerçek adım ~ cell_size olmalı
+        # Endpoint fix: the actual step should be ~ cell_size
         self.x = np.linspace(x_min, x_min + (nx - 1) * cell_size, nx)
         self.y = np.linspace(y_min, y_min + (ny - 1) * cell_size, ny)
         self.X, self.Y = np.meshgrid(self.x, self.y)
 
-        # Gerçek hedef konumları (kuyu verisi üretmek için)
+        # True target locations (used to generate well data)
         self._target_zones = []
-        # Katman bazlı grid metadata (co-registration ve farklı çözünürlük testleri)
+        # Per-layer grid metadata (co-registration and multi-resolution tests)
         self.layer_data = {}
 
     # ─────────────────────────────────────────────────────────────────────
     def generate(self) -> dict:
-        """Seçilen senaryoya göre tüm katmanları üretir."""
+        """Generates all layers for the selected scenario."""
         gen_map = {
             'porphyry_copper': self._gen_porphyry_copper,
             'epithermal_gold': self._gen_epithermal_gold,
@@ -271,17 +291,17 @@ class RealisticGeoDataGenerator:
             'geothermal':      self._gen_geothermal,
         }
         if self.scenario not in gen_map:
-            raise ValueError(f"Bilinmeyen senaryo. Seçenekler: {self.SCENARIOS}")
+            raise ValueError(f"Unknown scenario. Options: {self.SCENARIOS}")
 
         layers = gen_map[self.scenario]()
 
-        # Her katmana gerçekçi gürültü ve veri boşluğu ekle
+        # Add realistic noise and data gaps to each layer
         layers = self._add_noise_and_gaps(layers)
         self.layer_data = self._build_layer_data(layers)
 
-        print(f"\n  ✓ {len(layers)} katman üretildi ({self.scenario})")
+        print(f"\n  ✓ {len(layers)} layers generated ({self.scenario})")
         if self.layer_grid_variations and (self.vary_layer_alignment or self.vary_layer_resolutions):
-            print("    - Katman bazlı grid varyasyonları aktif (çözünürlük/hizalama farkı)")
+            print("    - Per-layer grid variations enabled (resolution/alignment differences)")
         for name, meta in self.layer_data.items():
             grid = meta['grid']
             valid = ~np.isnan(grid)
@@ -291,14 +311,14 @@ class RealisticGeoDataGenerator:
             ny_i, nx_i = grid.shape
             print(
                 f"    {name:30}: {ny_i}x{nx_i} [{vmin:.2f}, {vmax:.2f}]  "
-                f"{'(%{:.0f} boş)'.format(nan_pct) if nan_pct > 0 else ''}"
+                f"{'({:.0f}% empty)'.format(nan_pct) if nan_pct > 0 else ''}"
             )
 
         return {name: meta['grid'] for name, meta in self.layer_data.items()}
 
     def get_layer_data(self) -> dict:
         """
-        Katman bazlı grid + koordinat metadata'sı döndürür.
+        Returns per-layer grid + coordinate metadata.
         {layer_name: {'grid', 'x', 'y'}}
         """
         if not self.layer_data:
@@ -313,7 +333,7 @@ class RealisticGeoDataGenerator:
         }
 
     def _layer_resolution_scale(self, layer_name: str) -> float:
-        """Katman tipine göre hedef çözünürlük çarpanı."""
+        """Target resolution scale factor for the given layer type."""
         lname = layer_name.lower()
         if 'geochemistry' in lname:
             base = 0.35
@@ -334,8 +354,8 @@ class RealisticGeoDataGenerator:
 
     def _resample_layer_to_grid(self, grid: np.ndarray, x_new: np.ndarray, y_new: np.ndarray) -> np.ndarray:
         """
-        Temel grid'i katman bazlı yeni grid koordinatlarına yeniden örnekler.
-        NaN alanları yaklaşık korunur.
+        Resamples the base grid onto the new per-layer grid coordinates.
+        NaN regions are approximately preserved.
         """
         if grid.shape == (len(y_new), len(x_new)) and np.allclose(x_new, self.x) and np.allclose(y_new, self.y):
             return grid.astype(np.float32, copy=True)
@@ -362,8 +382,8 @@ class RealisticGeoDataGenerator:
 
     def _build_layer_data(self, layers: dict) -> dict:
         """
-        Katmanlara opsiyonel çözünürlük ve hizalama farklılıkları uygular.
-        Dokümanda vaat edilen co-registration test verisini üretmek için kullanılır.
+        Applies optional resolution and alignment differences to the layers.
+        Used to produce the co-registration test data described in the documentation.
         """
         if not self.layer_grid_variations:
             return {
@@ -389,7 +409,7 @@ class RealisticGeoDataGenerator:
             else:
                 ox_cells = oy_cells = 0
 
-            # Küçük ofset: veri setleri farklı survey başlangıçlarına sahipmiş gibi
+            # Small offset: as if the datasets had different survey origins
             ox = ox_cells * self.cell_size * 0.5
             oy = oy_cells * self.cell_size * 0.5
             x_i = np.linspace(x_min + ox, x_max + ox, nx_i)
@@ -406,68 +426,70 @@ class RealisticGeoDataGenerator:
     # ─────────────────────────────────────────────────────────────────────
     def _gen_porphyry_copper(self) -> dict:
         """
-        Porfiri Bakır Yatağı Senaryosu
+        Porphyry Copper Deposit Scenario
         --------------------------------
-        Gerçek jeoloji: Granitik intüzyon → porfiri bakır-molibden
-        Jeofizik imzası:
-          - Yüksek manyetik (manyetit alterasyon zonu)
-          - Güçlü IP anomalisi (pirit + kalkopirit)
-          - Düşük rezistivite (kil alterasyon + sülfür)
-          - Cu-Mo-Au jeokimyasal anomali
-          - Gravite düşüğü (düşük yoğunluklu granitik kaya)
+        Real geology: granitic intrusion → porphyry copper-molybdenum
+        Geophysical signature:
+          - Magnetic high (magnetite alteration zone)
+          - Strong IP anomaly (pyrite + chalcopyrite)
+          - Low resistivity (clay alteration + sulphides)
+          - Cu-Mo-Au geochemical anomaly
+          - Gravity low (low-density granitic rock)
         """
         X, Y = self.X, self.Y
-        cx, cy = self.x[self.nx//2], self.y[self.ny//2]  # Merkez
+        cx, cy = self.x[self.nx//2], self.y[self.ny//2]  # Centre
 
-        # Ana intüzyon (porfiri gövde)
-        # Gerçek porfiri sistemleri 2-5 km çaplı olabilir
+        # Main intrusion (porphyry stock)
+        # Real porphyry systems can be 2-5 km in diameter
         intrusion_radius = 1500  # m
 
-        # ─ Manyetik ──────────────────────────────────────────────────────
-        # Ana manyetit potasik alterasyon zonu
+        # ─ Magnetic ──────────────────────────────────────────────────────
+        # Main magnetite-bearing potassic alteration zone
+        # Magnetite zone: χ≈0.07 SI × H≈40 A/m → M≈3 A/m
         mag = magnetic_dipole(
-            X, Y, cx, cy, depth=300,
-            magnetization=5000, inclination_deg=55, declination_deg=5
+            X, Y, cx, cy, depth=400, radius=350,
+            magnetization=3.0, inclination_deg=55, declination_deg=5
         )
-        # Propilitik halka (çevre düşük manyetik)
+        # Propylitic halo (weakly magnetic periphery)
         mag += magnetic_dipole(
-            X, Y, cx + 800, cy + 600, depth=600,
-            magnetization=1500, inclination_deg=55, declination_deg=5
+            X, Y, cx + 800, cy + 600, depth=700, radius=500,
+            magnetization=0.8, inclination_deg=55, declination_deg=5
         )
-        # Fay kontağı (manyetik doğrusal)
+        # Fault contact (magnetic lineament)
+        # Fault contact: ~160 nT magnetic step between the two blocks (±80 nT)
         fault1 = create_fault_zone(X, Y, cx - 2000, cy, angle_deg=35, width=200, throw=80)
-        mag += gaussian_filter(fault1, sigma=3) * 20
-        # Bölgesel arka plan
+        mag += gaussian_filter(fault1, sigma=3)
+        # Regional background
         regional_trend = -0.3 * (X - X.mean()) / X.std() + 0.2 * (Y - Y.mean()) / Y.std()
-        mag += regional_trend * 50 + 200  # bölgesel alan
+        mag += regional_trend * 50 + 200  # regional field
 
-        # ─ Gravite ───────────────────────────────────────────────────────
-        # Granitik intüzyon: hafif kaya (ρ_granite ≈ 2650 vs host ≈ 2800)
-        grav = gravity_sphere(X, Y, cx, cy, depth=500,
+        # ─ Gravity ───────────────────────────────────────────────────────
+        # Granitic intrusion: light rock (ρ_granite ≈ 2650 vs host ≈ 2800)
+        grav = gravity_sphere(X, Y, cx, cy, depth=1800,
                                density_contrast=-150, radius=intrusion_radius)
-        # Yoğun cevherli zon
-        grav += gravity_sphere(X, Y, cx + 200, cy - 300, depth=200,
-                                density_contrast=300, radius=400)
-        # Bölgesel trend
+        # Dense ore-bearing zone
+        grav += gravity_sphere(X, Y, cx + 200, cy - 300, depth=450,
+                                density_contrast=300, radius=300)
+        # Regional trend
         grav += 0.5 * (Y - Y.mean()) / (self.ny * self.cell_size) * 2
 
-        # ─ Rezistivite ───────────────────────────────────────────────────
-        # Kil+altere zona (propilitik, filik) → çok düşük direnç
+        # ─ Resistivity ───────────────────────────────────────────────────
+        # Clay + altered zone (propylitic, phyllic) → very low resistivity
         res = resistivity_conductive_body(
             X, Y, cx, cy,
             half_width_x=intrusion_radius * 1.2,
             half_width_y=intrusion_radius,
-            resistivity_body=8,     # Ohm.m — kil zonu
+            resistivity_body=8,     # Ohm.m — clay zone
             resistivity_host=500,
         )
-        # Potasik merkez biraz daha yüksek
+        # Potassic core slightly higher
         inner = create_intrusion(X, Y, cx, cy, rx=500, ry=600)
-        res = res * (1 - inner * 0.3) + inner * 50  # merkez daha az iletken
+        res = res * (1 - inner * 0.3) + inner * 50  # core is less conductive
 
         # ─ IP Chargeability ──────────────────────────────────────────────
-        # Pirit+kalkopirit → yüksek IP
+        # Pyrite + chalcopyrite → high IP
         ip = np.zeros_like(X)
-        # Ana sülfür zonu (potasik alterasyon çevresi)
+        # Main sulphide zone (around the potassic alteration)
         for dx_off, dy_off, amp, sz in [
             (300, -200, 35, 600),
             (-200, 400, 25, 500),
@@ -478,29 +500,29 @@ class RealisticGeoDataGenerator:
                 -((X - cx - dx_off)**2 + (Y - cy - dy_off)**2) / (2 * sz**2)
             )
 
-        # ─ Jeokimya: Cu (ppm) ────────────────────────────────────────────
+        # ─ Geochemistry: Cu (ppm) ────────────────────────────────────────
         geo_cu = lognormal_geochemistry(
             X, Y, cx + 100, cy - 100,
             anomaly_value=800, background=25,
             sigma_x=900, sigma_y=700, angle_deg=20, rng=self.rng
         )
-        # Halo (süperjenik zenginleşme)
+        # Halo (supergene enrichment)
         geo_cu += lognormal_geochemistry(
             X, Y, cx + 400, cy + 300,
             anomaly_value=200, background=0,
             sigma_x=1200, sigma_y=800, angle_deg=40, rng=self.rng
         )
 
-        # ─ Jeokimya: Au (ppb) ────────────────────────────────────────────
+        # ─ Geochemistry: Au (ppb) ────────────────────────────────────────
         geo_au = lognormal_geochemistry(
             X, Y, cx - 100, cy + 200,
             anomaly_value=0.5, background=0.003,
             sigma_x=700, sigma_y=500, angle_deg=10, rng=self.rng
         )
 
-        # ─ Hedef zonlar ──────────────────────────────────────────────────
+        # ─ Target zones ──────────────────────────────────────────────────
         self._target_zones = [
-            # (x, y, radius_m, tip)
+            # (x, y, radius_m, type)
             (cx,        cy,        600, 'primary'),
             (cx + 300,  cy - 200,  400, 'secondary'),
             (cx - 200,  cy + 400,  300, 'secondary'),
@@ -518,19 +540,19 @@ class RealisticGeoDataGenerator:
     # ─────────────────────────────────────────────────────────────────────
     def _gen_epithermal_gold(self) -> dict:
         """
-        Epitermal Altın Yatağı Senaryosu (Düşük Sülfürasyon)
-        -------------------------------------------------------
-        Jeotermal sistem > silisleşme > altın
-        İmza:
-          - Yüksek rezistivite (silika kap) + düşük rezistivite (kil altı)
-          - Manyetik düşük (demagnetizasyon)
-          - Fay kontrollü damarlar
-          - As-Sb-Hg jeokimyasal halo
+        Epithermal Gold Deposit Scenario (Low Sulphidation)
+        ---------------------------------------------------
+        Geothermal system > silicification > gold
+        Signature:
+          - High resistivity (silica cap) + low resistivity (underlying clay)
+          - Magnetic low (demagnetization)
+          - Fault-controlled veins
+          - As-Sb-Hg geochemical halo
         """
         X, Y = self.X, self.Y
         cx, cy = self.x[int(self.nx * 0.45)], self.y[int(self.ny * 0.55)]
 
-        # Ana damar sistemi: 3 paralel fay
+        # Main vein system: 3 parallel faults
         faults = []
         for i, (off, ang) in enumerate([(0, 25), (800, 28), (-600, 22)]):
             f = create_fault_zone(
@@ -538,37 +560,40 @@ class RealisticGeoDataGenerator:
                 width=150, throw=100 + i * 30
             )
             faults.append(gaussian_filter(f, sigma=2))
+        # create_fault_zone returns a step (±throw); for proximity to the fault
+        # the band where |f| is small is used: 1 = on the fault, → 0 moving away
+        proximity = [np.exp(-np.abs(f) / 50.0) for f in faults]
 
-        # Manyetik: Demagnetizasyon zonu (silisleşme)
-        mag = np.ones_like(X) * 150  # bölgesel
+        # Magnetic: demagnetization zone (silicification)
+        mag = np.ones_like(X) * 150  # regional
         demag = create_intrusion(X, Y, cx, cy, rx=1200, ry=1800, angle_deg=25)
-        mag -= demag * 120  # demagnetizasyon düşüğü
-        for f in faults:
-            mag += f * 15  # fay kenarı magnetik yüksek
+        mag -= demag * 120  # demagnetization low
+        for prox in proximity:
+            mag += 40 * prox  # linear magnetic high along the fault (~40 nT)
 
-        # Rezistivite: Çok katmanlı yapı
-        res = np.ones_like(X) * 200  # arka plan
-        # Silika kap: yüksek rezistivite
+        # Resistivity: multi-layer structure
+        res = np.ones_like(X) * 200  # background
+        # Silica cap: high resistivity
         silica_cap = create_intrusion(X, Y, cx, cy, rx=800, ry=1200, angle_deg=25)
         res = res * (1 - silica_cap) + 2000 * silica_cap
-        # Kil zonu altında: düşük rezistivite
+        # Underlying clay zone: low resistivity
         clay_zone = create_intrusion(X, Y, cx, cy, rx=1500, ry=2000, angle_deg=25)
         res = np.where(clay_zone > silica_cap, 15, res)
-        # Damar boyunca düşük rezistivite
-        for f in faults:
-            res -= np.abs(f) * 30
+        # Low resistivity along the veins (value drops to 40% in the fault zone)
+        for prox in proximity:
+            res *= 1 - 0.6 * prox
 
-        # IP: Düşük sülfürasyon → düşük IP (epitermali porfiriden ayırt eder)
-        ip = np.ones_like(X) * 3  # düşük arka plan
-        for f in faults:
-            ip += np.exp(-np.abs(f) / 50) * 8  # damar IP halosu
+        # IP: low sulphidation → low IP (distinguishes epithermal from porphyry)
+        ip = np.ones_like(X) * 3  # low background
+        for prox in proximity:
+            ip += 8 * prox  # vein IP halo
 
-        # Gravite: Silisleşme zonu yoğun
-        grav = gravity_sphere(X, Y, cx, cy, depth=200,
-                               density_contrast=100, radius=800)
-        grav += self.rng.standard_normal(X.shape) * 0.2  # ölçüm gürültüsü
+        # Gravity: silicification zone is dense
+        grav = gravity_sphere(X, Y, cx, cy, depth=900,
+                               density_contrast=100, radius=700)
+        grav += self.rng.standard_normal(X.shape) * 0.2  # measurement noise
 
-        # Jeokimya
+        # Geochemistry
         geo_au = lognormal_geochemistry(
             X, Y, cx, cy, anomaly_value=2.0, background=0.005,
             sigma_x=600, sigma_y=1200, angle_deg=25, rng=self.rng
@@ -601,93 +626,93 @@ class RealisticGeoDataGenerator:
     # ─────────────────────────────────────────────────────────────────────
     def _gen_groundwater(self) -> dict:
         """
-        Yeraltı Suyu Akiferi Senaryosu
-        --------------------------------
-        Alüvyonel/karstik akifer sistemi
-        İmza:
-          - Düşük rezistivite akifer (tuzluluk derecesine bağlı: 5-50 Ohm.m)
-          - Gravite düşüğü (düşük yoğunluklu alüvyon)
-          - Zayıf/yok manyetik anomali
-          - Klorür jeokimyası
+        Groundwater Aquifer Scenario
+        ----------------------------
+        Alluvial/karst aquifer system
+        Signature:
+          - Low-resistivity aquifer (depends on salinity: 5-50 Ohm.m)
+          - Gravity low (low-density alluvium)
+          - Weak/absent magnetic anomaly
+          - Chloride geochemistry
         """
         X, Y = self.X, self.Y
 
-        # İki akifer sistemi: alüvyal + karstik
-        # Alüvyal kanal (nehir vadisi boyunca uzanan)
-        akifer1_cx = self.x[self.nx // 3]
-        akifer1_cy = self.y[self.ny // 2]
+        # Two aquifer systems: alluvial + karst
+        # Alluvial channel (extending along a river valley)
+        aquifer1_cx = self.x[self.nx // 3]
+        aquifer1_cy = self.y[self.ny // 2]
 
-        # Karstik akifer (daha derin, geniş)
-        akifer2_cx = self.x[int(self.nx * 0.65)]
-        akifer2_cy = self.y[int(self.ny * 0.4)]
+        # Karst aquifer (deeper, wider)
+        aquifer2_cx = self.x[int(self.nx * 0.65)]
+        aquifer2_cy = self.y[int(self.ny * 0.4)]
 
-        # ─ Rezistivite ───────────────────────────────────────────────────
-        # Kuru zemin arka plan: 300-800 Ohm.m
+        # ─ Resistivity ───────────────────────────────────────────────────
+        # Dry-ground background: 300-800 Ohm.m
         res_background = 400 + gaussian_filter(
             self.rng.standard_normal(X.shape) * 50, sigma=10
         )
-        # Alüvyal akifer (tatlı su, 15-40 Ohm.m)
-        akifer1_mask = resistivity_conductive_body(
-            X, Y, akifer1_cx, akifer1_cy,
+        # Alluvial aquifer (fresh water, 15-40 Ohm.m)
+        aquifer1_mask = resistivity_conductive_body(
+            X, Y, aquifer1_cx, aquifer1_cy,
             half_width_x=500, half_width_y=2500,
             resistivity_body=18, resistivity_host=400,
         )
-        # Karstik akifer (biraz daha dirençli, 30-80 Ohm.m)
-        akifer2_mask = resistivity_conductive_body(
-            X, Y, akifer2_cx, akifer2_cy,
+        # Karst aquifer (somewhat more resistive, 30-80 Ohm.m)
+        aquifer2_mask = resistivity_conductive_body(
+            X, Y, aquifer2_cx, aquifer2_cy,
             half_width_x=1800, half_width_y=1400,
             resistivity_body=45, resistivity_host=400,
         )
-        res = np.minimum(akifer1_mask, akifer2_mask)
-        # Arka plan heterojenliğini koru (tekdüze host yerine daha gerçekçi)
+        res = np.minimum(aquifer1_mask, aquifer2_mask)
+        # Preserve background heterogeneity (more realistic than a uniform host)
         res = np.minimum(res, res_background)
-        # Tuzlu su zonu (derin): 1-5 Ohm.m
+        # Saline water zone (deep): 1-5 Ohm.m
         saline_mask = resistivity_conductive_body(
-            X, Y, akifer1_cx - 200, akifer1_cy - 1000,
+            X, Y, aquifer1_cx - 200, aquifer1_cy - 1000,
             half_width_x=300, half_width_y=400,
             resistivity_body=3, resistivity_host=400,
         )
         res = np.minimum(res, saline_mask)
 
-        # ─ Gravite ───────────────────────────────────────────────────────
-        # Alüvyon dolgusu (düşük yoğunluk): gravite düşüğü
+        # ─ Gravity ───────────────────────────────────────────────────────
+        # Alluvial fill (low density): gravity low
         grav = gravity_sphere(
-            X, Y, akifer1_cx, akifer1_cy, depth=50,
-            density_contrast=-200, radius=600
+            X, Y, aquifer1_cx, aquifer1_cy, depth=400,
+            density_contrast=-200, radius=350
         )
         grav += gravity_horizontal_slab(
-            X, akifer2_cx,
+            X, aquifer2_cx,
             half_width=1800, depth_top=20, depth_bot=200,
             density_contrast=-180,
         )
         grav += gaussian_filter(self.rng.standard_normal(X.shape) * 0.1, sigma=5)
 
-        # ─ Manyetik (zayıf) ──────────────────────────────────────────────
+        # ─ Magnetic (weak) ───────────────────────────────────────────────
         mag = gaussian_filter(self.rng.standard_normal(X.shape) * 5, sigma=3) + 100
-        # Bazalt akifer tabanı: zayıf pozitif
+        # Basalt aquifer base: weak positive
         mag += magnetic_dipole(
-            X, Y, akifer2_cx, akifer2_cy, depth=300,
-            magnetization=500, inclination_deg=55
+            X, Y, aquifer2_cx, aquifer2_cy, depth=300, radius=250,
+            magnetization=0.3, inclination_deg=55
         )
 
-        # ─ Jeokimya: Klorür ──────────────────────────────────────────────
+        # ─ Geochemistry: Chloride ────────────────────────────────────────
         geo_cl = lognormal_geochemistry(
-            X, Y, akifer1_cx, akifer1_cy,
+            X, Y, aquifer1_cx, aquifer1_cy,
             anomaly_value=400, background=10,
             sigma_x=500, sigma_y=2500, angle_deg=0, rng=self.rng
         )
-        # EC (Elektriksel iletkenlik) proxy
+        # EC (electrical conductivity) proxy
         geo_ec = lognormal_geochemistry(
-            X, Y, akifer2_cx, akifer2_cy,
+            X, Y, aquifer2_cx, aquifer2_cy,
             anomaly_value=800, background=50,
             sigma_x=1800, sigma_y=1400, angle_deg=15, rng=self.rng
         )
 
         self._target_zones = [
-            (akifer1_cx,         akifer1_cy,         400, 'primary'),
-            (akifer1_cx,         akifer1_cy + 1000,  300, 'primary'),
-            (akifer2_cx,         akifer2_cy,         700, 'primary'),
-            (akifer1_cx - 200,   akifer1_cy - 1000,  200, 'secondary'),
+            (aquifer1_cx,         aquifer1_cy,         400, 'primary'),
+            (aquifer1_cx,         aquifer1_cy + 1000,  300, 'primary'),
+            (aquifer2_cx,         aquifer2_cy,         700, 'primary'),
+            (aquifer1_cx - 200,   aquifer1_cy - 1000,  200, 'secondary'),
         ]
 
         return {
@@ -701,30 +726,31 @@ class RealisticGeoDataGenerator:
     # ─────────────────────────────────────────────────────────────────────
     def _gen_geothermal(self) -> dict:
         """
-        Jeotermal Sistem Senaryosu
-        ---------------------------
-        Volkanik/magmatik ısı kaynağı üzerinde konvektif sistem
-        İmza:
-          - Çok düşük rezistivite (sıcak tuzlu akifer: 1-10 Ohm.m)
-          - Gravite düşüğü (sıcak düşük yoğunluklu akifer)
-          - Manyetik düşük (kızıl ısınma → demagnetizasyon)
-          - Yüksek CO₂, H₂S jeokimyası
+        Geothermal System Scenario
+        --------------------------
+        Convective system above a volcanic/magmatic heat source
+        Signature:
+          - Very low resistivity (hot saline aquifer: 1-10 Ohm.m)
+          - Gravity low (hot, low-density aquifer)
+          - Magnetic low (thermal heating → demagnetization)
+          - High CO₂, H₂S geochemistry
         """
         X, Y = self.X, self.Y
         cx, cy = self.x[self.nx//2], self.y[self.ny//2]
 
-        # Magma odası (derin, 5-10 km)
-        mag_chamber_depth = 5000
-        heat_source_depth  = 1500
+        # Centre depth of the heat source (hot, low-density reservoir).
+        # The deep magma chamber (5-10 km) is not modelled separately because it
+        # does not produce a short-wavelength anomaly measurable at the surface.
+        heat_source_depth = 1500
 
-        # ─ Rezistivite (en önemli!) ───────────────────────────────────────
-        # Jeotermal rezervuar: 2-15 Ohm.m
+        # ─ Resistivity (most important!) ──────────────────────────────────
+        # Geothermal reservoir: 2-15 Ohm.m
         res = resistivity_conductive_body(
             X, Y, cx, cy,
             half_width_x=2500, half_width_y=2200,
             resistivity_body=5, resistivity_host=300,
         )
-        # Kap kaya (clay cap): ultra düşük
+        # Cap rock (clay cap): ultra-low
         cap_rock = resistivity_conductive_body(
             X, Y, cx + 200, cy - 300,
             half_width_x=1200, half_width_y=1000,
@@ -732,7 +758,7 @@ class RealisticGeoDataGenerator:
         )
         res = np.minimum(res, cap_rock)
 
-        # Fumarol/yüzey çıkış noktaları
+        # Fumaroles / surface discharge points
         for soff_x, soff_y in [(200, 400), (-300, -200), (600, -100)]:
             surface_alt = resistivity_conductive_body(
                 X, Y, cx + soff_x, cy + soff_y,
@@ -741,31 +767,31 @@ class RealisticGeoDataGenerator:
             )
             res = np.minimum(res, surface_alt)
 
-        # ─ Manyetik ──────────────────────────────────────────────────────
+        # ─ Magnetic ──────────────────────────────────────────────────────
         mag = np.ones_like(X) * 180
-        # Demagnetizasyon (kızıl ısınma): büyük negatif anomali
+        # Demagnetization (thermal heating): large negative anomaly
         demag_zone = create_intrusion(X, Y, cx, cy, rx=2000, ry=1800)
         mag -= demag_zone * 200
-        # Aktif volkanik kon: kuvvetli pozitif
+        # Active volcanic cone: strong positive
         mag += magnetic_dipole(
-            X, Y, cx + 1000, cy + 800, depth=200,
-            magnetization=8000, inclination_deg=55
+            X, Y, cx + 1000, cy + 800, depth=300, radius=250,
+            magnetization=5.0, inclination_deg=55
         )
-        # Genç lav akıntıları
+        # Young lava flows
         mag += magnetic_dipole(
-            X, Y, cx - 800, cy + 400, depth=50,
-            magnetization=3000, inclination_deg=55
+            X, Y, cx - 800, cy + 400, depth=80, radius=60,
+            magnetization=5.0, inclination_deg=55
         )
 
-        # ─ Gravite ───────────────────────────────────────────────────────
+        # ─ Gravity ───────────────────────────────────────────────────────
         grav = gravity_sphere(X, Y, cx, cy, depth=heat_source_depth,
-                               density_contrast=-200, radius=2000)
-        # Yüzey hidrotermal tortul: negatif
-        grav += gravity_sphere(X, Y, cx + 200, cy - 300, depth=100,
-                                density_contrast=-150, radius=600)
+                               density_contrast=-200, radius=1200)
+        # Surface hydrothermal deposits: negative
+        grav += gravity_sphere(X, Y, cx + 200, cy - 300, depth=400,
+                                density_contrast=-150, radius=300)
         grav += gaussian_filter(self.rng.standard_normal(X.shape) * 0.15, sigma=8)
 
-        # ─ Jeokimya ──────────────────────────────────────────────────────
+        # ─ Geochemistry ──────────────────────────────────────────────────
         geo_co2 = lognormal_geochemistry(
             X, Y, cx, cy, anomaly_value=5000, background=0.04,
             sigma_x=1500, sigma_y=1500, rng=self.rng
@@ -797,48 +823,48 @@ class RealisticGeoDataGenerator:
     # ─────────────────────────────────────────────────────────────────────
     def _add_noise_and_gaps(self, layers: dict) -> dict:
         """
-        Her katmana gerçekçi gürültü ve veri boşlukları ekler.
+        Adds realistic noise and data gaps to each layer.
         """
-        # Gürültü seviyeleri (her tip için tipik SNR)
+        # Noise levels (typical SNR for each type)
         noise_cfg = {
-            'magnetic':     (0.02, 3.0),    # (oran, sigma) — düşük gürültü
-            'gravity':      (0.01, 5.0),    # çok düşük gürültü
-            'resistivity':  (0.08, 2.0),    # orta gürültü
-            'ip':           (0.12, 1.5),    # yüksek gürültü
-            'geochemistry': (0.25, 1.0),    # en gürültülü
+            'magnetic':     (0.02, 3.0),    # (ratio, sigma) — low noise
+            'gravity':      (0.01, 5.0),    # very low noise
+            'resistivity':  (0.08, 2.0),    # moderate noise
+            'ip':           (0.12, 1.5),    # high noise
+            'geochemistry': (0.25, 1.0),    # noisiest
         }
 
-        # Veri boşlukları (topoğrafya, köy, askeri alan vb.)
+        # Data gaps (topography, villages, military areas, etc.)
         ny, nx = self.ny, self.nx
         gap_centers = [
-            (int(nx * 0.8), int(ny * 0.15), 15),   # küçük engel
-            (int(nx * 0.2), int(ny * 0.7),  20),   # orta engel
-            (int(nx * 0.6), int(ny * 0.4),  10),   # küçük engel
+            (int(nx * 0.8), int(ny * 0.15), 15),   # small obstacle
+            (int(nx * 0.2), int(ny * 0.7),  20),   # medium obstacle
+            (int(nx * 0.6), int(ny * 0.4),  10),   # small obstacle
         ]
         gap_mask = create_data_gap((ny, nx), gap_centers)
 
         processed = {}
         for name, grid in layers.items():
-            # Gürültü seviyesi
-            noise_ratio, smooth_sigma = (0.05, 2.0)  # varsayılan
+            # Noise level
+            noise_ratio, smooth_sigma = (0.05, 2.0)  # default
             for kw, cfg in noise_cfg.items():
                 if kw in name:
                     noise_ratio, smooth_sigma = cfg
                     break
 
-            # Gürültü: ölçüm hatası + spatyal korelasyon
+            # Noise: measurement error + spatial correlation
             signal_range = np.nanpercentile(grid, 98) - np.nanpercentile(grid, 2)
             raw_noise = self.rng.standard_normal((ny, nx)) * signal_range * noise_ratio
             corr_noise = gaussian_filter(raw_noise, sigma=smooth_sigma)
             noisy = grid + corr_noise
 
-            # Veri boşlukları (sadece jeokimyaya daha sık uygula)
+            # Data gaps (geochemistry alone gets the denser gap treatment)
             if 'geochemistry' in name:
-                # Jeokimya: daha seyrek örnekleme (sadece yollar boyunca)
+                # Geochemistry: sparser sampling (only along roads)
                 sample_mask = self._create_sampling_pattern(ny, nx)
                 noisy = np.where(sample_mask, noisy, np.nan)
             else:
-                noisy = noisy * gap_mask  # gap_mask: 1=veri var, nan=yok
+                noisy = noisy * gap_mask  # gap_mask: 1=data present, nan=missing
 
             processed[name] = noisy.astype(np.float32)
 
@@ -846,14 +872,14 @@ class RealisticGeoDataGenerator:
 
     def _create_sampling_pattern(self, ny, nx, grid_spacing_pct=0.08):
         """
-        Jeokimya örnekleme: ızgara deseni (her ~%8 piksel örneklenmiş).
-        Gerçekte jeokimya gridleri seyrek noktalardan interpolasyon.
+        Geochemical sampling: grid pattern (one sample every ~8% of the grid size).
+        In practice, geochemistry grids are interpolated from sparse points.
         """
         mask = np.zeros((ny, nx), dtype=bool)
         step = max(1, int(ny * grid_spacing_pct))
         for i in range(0, ny, step):
             for j in range(0, nx, step):
-                # Küçük rastgele kaydırma (düzenli ızgara değil)
+                # Small random jitter (not a regular grid)
                 di = int(self.rng.integers(-step // 3, step // 3 + 1))
                 dj = int(self.rng.integers(-step // 3, step // 3 + 1))
                 ri, rj = np.clip(i+di, 0, ny-1), np.clip(j+dj, 0, nx-1)
@@ -870,14 +896,14 @@ class RealisticGeoDataGenerator:
         seed: int = None,
     ) -> pd.DataFrame:
         """
-        Gerçekçi kuyu verisi üretir.
+        Generates realistic well data.
 
-        Parametreler
-        ------------
-        imbalance_ratio : neg/pos oranı (örn. 15 → 80 kuyunun 5'i pozitif)
-        n_total         : Toplam kuyu sayısı
-        add_realistic_errors : Yanlış negatifler ekle (gerçekte çıkmış ama
-                               rapor edilmemiş/yanlış koordinat gibi)
+        Parameters
+        ----------
+        imbalance_ratio : neg/pos ratio (e.g. 15 → 5 of 80 wells are positive)
+        n_total         : Total number of wells
+        add_realistic_errors : Add false negatives (e.g. a real hit that was
+                               not reported, or has wrong coordinates)
         """
         if not self._target_zones:
             self.generate()
@@ -886,26 +912,26 @@ class RealisticGeoDataGenerator:
         rng_seed = (self.seed + 99) if seed is None else int(seed)
         rng = np.random.default_rng(rng_seed)
 
-        # Kaç pozitif?
+        # How many positives?
         n_pos = max(3, int(n_total / (1 + imbalance_ratio)))
         n_neg = n_total - n_pos
 
         wells = []
 
-        # ─ POZİTİF KUYULAR ─────────────────────────────────────────────
+        # ─ POSITIVE WELLS ──────────────────────────────────────────────
         pos_placed = 0
         for zone_x, zone_y, zone_r, zone_type in self._target_zones:
             n_this_zone = max(1, n_pos // len(self._target_zones))
             for _ in range(n_this_zone):
                 if pos_placed >= n_pos:
                     break
-                # Hedef zon içinde rastgele yer
+                # Random location inside the target zone
                 angle = float(rng.uniform(0, 2 * np.pi))
                 r = float(rng.uniform(0, zone_r * 0.6))
                 wx = zone_x + r * np.cos(angle)
                 wy = zone_y + r * np.sin(angle)
 
-                # Koordinat sınırları içinde mi?
+                # Within the coordinate bounds?
                 if (self.x.min() < wx < self.x.max() and
                         self.y.min() < wy < self.y.max()):
                     wells.append({
@@ -915,7 +941,7 @@ class RealisticGeoDataGenerator:
                     })
                     pos_placed += 1
 
-        # Kalan pozitif (yeterli dolmadıysa)
+        # Remaining positives (if not enough were placed)
         while pos_placed < n_pos:
             tz = self._target_zones[int(rng.integers(len(self._target_zones)))]
             wx = tz[0] + float(rng.uniform(-tz[2], tz[2]))
@@ -925,7 +951,7 @@ class RealisticGeoDataGenerator:
                                'depth': float(rng.uniform(100, 400))})
                 pos_placed += 1
 
-        # ─ NEGATİF KUYULAR ─────────────────────────────────────────────
+        # ─ NEGATIVE WELLS ──────────────────────────────────────────────
         target_xs = [t[0] for t in self._target_zones]
         target_ys = [t[1] for t in self._target_zones]
         min_dist_from_target = min(t[2] for t in self._target_zones) * 2
@@ -937,7 +963,7 @@ class RealisticGeoDataGenerator:
             wx = rng.uniform(self.x.min(), self.x.max())
             wy = rng.uniform(self.y.min(), self.y.max())
 
-            # Hedef zonlardan yeterince uzak
+            # Far enough from the target zones
             far_enough = all(
                 np.sqrt((wx - tx)**2 + (wy - ty)**2) > min_dist_from_target
                 for tx, ty in zip(target_xs, target_ys)
@@ -952,8 +978,8 @@ class RealisticGeoDataGenerator:
 
         if neg_placed < n_neg:
             warnings.warn(
-                f"Hedeflenen negatif kuyu sayısı üretilemedi: {neg_placed}/{n_neg}. "
-                "Alan/mesafe kısıtları nedeniyle eksik üretim oluştu.",
+                f"Could not generate the requested number of negative wells: {neg_placed}/{n_neg}. "
+                "Fewer were generated because of area/distance constraints.",
                 UserWarning
             )
 
@@ -961,10 +987,10 @@ class RealisticGeoDataGenerator:
         df['target_type'] = SCENARIO_TARGET_TYPE_MAP.get(scenario, 'generic')
         df['scenario'] = scenario
 
-        # ─ GERÇEKÇİ HATALAR ────────────────────────────────────────────
+        # ─ REALISTIC ERRORS ────────────────────────────────────────────
         if add_realistic_errors:
-            # 1. Yanlış negatifler: aslında pozitif ama "boş" raporlanmış
-            #    (%10-15 gerçek madencilikte bu olur)
+            # 1. False negatives: actually positive but reported as "barren"
+            #    (this happens in 10-15% of cases in real mining)
             pos_mask = df['label'] == 1
             flip_n = max(0, int(pos_mask.sum() * 0.1))
             if flip_n > 0:
@@ -972,7 +998,7 @@ class RealisticGeoDataGenerator:
                 df.loc[flip_idx, 'label'] = 0
                 df.loc[flip_idx, 'notes'] = 'misclassified_neg'
 
-            # 2. Koordinat belirsizliği: GPS hatası (±50m)
+            # 2. Coordinate uncertainty: GPS error (±50m)
             df['x'] += rng.normal(0, 30, len(df))
             df['y'] += rng.normal(0, 30, len(df))
 
@@ -980,47 +1006,29 @@ class RealisticGeoDataGenerator:
         n_pos_final = (df['label'] == 1).sum()
         n_neg_final = (df['label'] == 0).sum()
         print(
-            f"\n  ✓ Kuyu verisi üretildi: {len(df)} kuyu | "
-            f"Pozitif: {n_pos_final} | Negatif: {n_neg_final} | "
-            f"Oran: {n_neg_final/max(1,n_pos_final):.1f}:1"
+            f"\n  ✓ Well data generated: {len(df)} wells | "
+            f"Positive: {n_pos_final} | Negative: {n_neg_final} | "
+            f"Ratio: {n_neg_final/max(1,n_pos_final):.1f}:1"
         )
         return df
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SURFER ASCII GRD YAZICI (PC'de doğrudan açılabilir)
+# SURFER ASCII GRD WRITER (opens directly on a PC)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def save_surfer_ascii_grd(grid, x, y, filepath):
     """
-    Surfer ASCII GRD formatında kaydet (DSAA).
-    Surfer, Oasis Montaj ve diğer jeofizik yazılımlarda açılır.
+    Save in Surfer ASCII GRD format (DSAA).
+    Opens in Surfer, Oasis Montaj, QGIS and other geophysical software.
+    NaN → Surfer blank (1.70141e38); values are written with 10 significant digits
+    (no loss of precision for small geochemical values).
     """
-    ny, nx = grid.shape
-    # NaN → Surfer dummy
-    g = grid.copy().astype(float)
-    g[np.isnan(g)] = 1.70141e+38
-
-    xmin, xmax = x.min(), x.max()
-    ymin, ymax = y.min(), y.max()
-    valid = g[g < 1e30]
-    zmin = valid.min() if len(valid) else 0
-    zmax = valid.max() if len(valid) else 1
-
-    with open(filepath, 'w') as f:
-        f.write('DSAA\n')
-        f.write(f'{nx} {ny}\n')
-        f.write(f'{xmin:.6f} {xmax:.6f}\n')
-        f.write(f'{ymin:.6f} {ymax:.6f}\n')
-        f.write(f'{zmin:.6f} {zmax:.6f}\n')
-        # Veriyi satır satır yaz
-        for row in g:
-            f.write(' '.join(f'{v:.4f}' for v in row))
-            f.write('\n')
+    return _write_surfer_ascii(grid, x, y, filepath)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TOPLU KAYDETME
+# BATCH SAVING
 # ─────────────────────────────────────────────────────────────────────────────
 
 def save_test_dataset(
@@ -1032,13 +1040,13 @@ def save_test_dataset(
     layer_data: dict = None,
 ):
     """
-    Tüm katmanları ve kuyu verisini belirtilen formatlarda kaydeder.
+    Saves all layers and the well data in the specified formats.
 
-    formats: ['surfer_grd', 'xyz', 'csv'] kombinasyonları
+    formats: any combination of ['surfer_grd', 'xyz', 'csv']
     """
     if formats is None:
         formats = ['surfer_grd', 'xyz']
-    formats = list(dict.fromkeys(formats))  # sırayı koru, tekrarları kaldır
+    formats = list(dict.fromkeys(formats))  # preserve order, remove duplicates
 
     Path(output_dir).mkdir(parents=True, exist_ok=True)
     layer_data = layer_data or generator.get_layer_data()
@@ -1053,8 +1061,8 @@ def save_test_dataset(
     unknown_formats = [f for f in formats if f not in valid_formats]
     if unknown_formats:
         warnings.warn(
-            f"Bilinmeyen format(lar) atlanacak: {unknown_formats}. "
-            f"Desteklenenler: {sorted(valid_formats)}",
+            f"Unknown format(s) will be skipped: {unknown_formats}. "
+            f"Supported: {sorted(valid_formats)}",
             UserWarning
         )
 
@@ -1078,7 +1086,7 @@ def save_test_dataset(
                 df_xyz = pd.DataFrame({
                     'X': X[mask], 'Y': Y[mask], 'Z': grid[mask]
                 })
-                df_xyz.to_csv(fp, index=False, sep='\t', float_format='%.4f')
+                df_xyz.to_csv(fp, index=False, sep='\t', float_format='%.10g')
                 saved.append(fp)
 
             elif fmt == 'csv':
@@ -1087,10 +1095,10 @@ def save_test_dataset(
                 mask = ~np.isnan(grid)
                 pd.DataFrame({
                     'X': X[mask], 'Y': Y[mask], 'value': grid[mask]
-                }).to_csv(fp, index=False, float_format='%.4f')
+                }).to_csv(fp, index=False, float_format='%.10g')
                 saved.append(fp)
 
-    # Kuyu verisi
+    # Well data
     wells_fp = os.path.join(output_dir, 'wells.csv')
     wells_export = wells_df.copy()
     if 'target_type' not in wells_export.columns:
@@ -1100,12 +1108,12 @@ def save_test_dataset(
     wells_export.to_csv(wells_fp, index=False, float_format='%.1f')
     saved.append(wells_fp)
 
-    print(f"\n  ✓ {len(saved)} dosya kaydedildi → {output_dir}/")
+    print(f"\n  ✓ {len(saved)} files saved → {output_dir}/")
     return saved
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# BÜTÜNLEŞIK TEST ÇALIŞTIRICISI
+# INTEGRATED TEST RUNNER
 # ─────────────────────────────────────────────────────────────────────────────
 
 def run_realistic_test(
@@ -1125,29 +1133,29 @@ def run_realistic_test(
     vary_layer_alignment: bool = True,
 ):
     """
-    Gerçekçi test verisi üret ve GeoAI pipeline'ını çalıştır.
+    Generate realistic test data and run the GeoAI pipeline.
 
-    Parametreler
-    ------------
+    Parameters
+    ----------
     scenario        : 'porphyry_copper' | 'epithermal_gold' |
                       'groundwater' | 'geothermal'
-    grid_size       : nx = ny = grid_size (örn. 500 → 500×500 = 250k piksel)
-    n_wells         : Toplam kuyu sayısı
-    imbalance_ratio : neg/pos oranı (15 → %6 pozitif, gerçekçi)
-    save_data       : Veriyi GRD+CSV olarak kaydet
-    run_geoai       : GeoAI pipeline'ını çalıştır
+    grid_size       : nx = ny = grid_size (e.g. 500 → 500×500 = 250k pixels)
+    n_wells         : Total number of wells
+    imbalance_ratio : neg/pos ratio (15 → ~6% positive, realistic)
+    save_data       : Save the data as GRD+CSV
+    run_geoai       : Run the GeoAI pipeline
     """
     import sys, os
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
     print(f"\n{'═'*60}")
-    print(f"  Gerçekçi Test: {scenario.upper()}")
-    print(f"  Grid: {grid_size}×{grid_size} = {grid_size**2:,} piksel")
-    print(f"  Kuyular: {n_wells} ({imbalance_ratio:.0f}:1 oran)")
+    print(f"  Realistic Test: {scenario.upper()}")
+    print(f"  Grid: {grid_size}×{grid_size} = {grid_size**2:,} pixels")
+    print(f"  Wells: {n_wells} ({imbalance_ratio:.0f}:1 ratio)")
     print(f"  Seed: {seed}")
     print(f"{'═'*60}")
 
-    # ─ 1. Veri Üret ──────────────────────────────────────────────────────
+    # ─ 1. Generate Data ──────────────────────────────────────────────────
     gen = RealisticGeoDataGenerator(
         nx=grid_size,
         ny=grid_size,
@@ -1164,7 +1172,7 @@ def run_realistic_test(
         n_total=n_wells,
     )
 
-    # ─ 2. Kaydet ─────────────────────────────────────────────────────────
+    # ─ 2. Save ───────────────────────────────────────────────────────────
     data_dir = os.path.join(output_dir, 'data')
     if save_data:
         save_test_dataset(
@@ -1172,14 +1180,14 @@ def run_realistic_test(
             formats=save_formats, layer_data=layer_data
         )
 
-    # ─ 3. GeoAI Çalıştır ─────────────────────────────────────────────────
+    # ─ 3. Run GeoAI ──────────────────────────────────────────────────────
     if run_geoai:
         from geoai.pipeline import GeoAIPipeline
 
         target_type = SCENARIO_TARGET_TYPE_MAP[scenario]
         pipe = GeoAIPipeline(project_name=f'Test_{scenario}')
 
-        # Katmanları array olarak ekle (dosyadan da eklenebilir)
+        # Add layers as arrays (they can also be added from files)
         for name, grid in layers.items():
             meta = layer_data.get(name, {'grid': grid, 'x': gen.x, 'y': gen.y})
             pipe.add_layer_array(meta['grid'], meta['x'], meta['y'], name)
@@ -1198,12 +1206,12 @@ def run_realistic_test(
             save_plots=save_plots,
         )
 
-        # Doğrulama: Önerilen hedefler gerçek zonu buluyor mu?
+        # Validation: do the proposed targets hit the true zones?
         if target_type in results:
             _validate_targets(results[target_type]['targets'], gen._target_zones, gen)
         else:
             warnings.warn(
-                f"GeoAI sonucu '{target_type}' için dönmedi; doğrulama atlandı.",
+                f"GeoAI returned no result for '{target_type}'; validation skipped.",
                 UserWarning
             )
 
@@ -1214,15 +1222,15 @@ def run_realistic_test(
 
 def _validate_targets(targets, true_zones, gen=None, top_k=10, distance_factor=2.5):
     """
-    Model sonuçlarını gerçek hedef zonlarıyla karşılaştır.
-    Kaç hedef gerçek zonu yakalamış?
+    Compare model results with the true target zones.
+    How many targets captured a true zone?
     """
     print(f"\n  {'─'*50}")
-    print(f"  DOĞRULAMA: Tahmin vs Gerçek")
+    print("  VALIDATION: Predicted vs True")
     print(f"  {'─'*50}")
 
     if not targets:
-        print("  ✗ Hedef listesi boş. Recall=0, Precision=0")
+        print("  ✗ Target list is empty. Recall=0, Precision=0")
         print(f"  {'─'*50}")
         return
 
@@ -1245,7 +1253,7 @@ def _validate_targets(targets, true_zones, gen=None, top_k=10, distance_factor=2
         if best_t is not None:
             used_target_idxs.add(best_idx)
             print(f"  ✓ HIT  {zone_type:10}: T{best_t['rank']} "
-                  f"({best_dist:.0f}m uzakta, P={best_t['max_probability']:.3f})")
+                  f"({best_dist:.0f}m away, P={best_t['max_probability']:.3f})")
             hit = True
             hit_count += 1
         if not hit:
@@ -1253,48 +1261,48 @@ def _validate_targets(targets, true_zones, gen=None, top_k=10, distance_factor=2
 
     recall = hit_count / len(true_zones) * 100
     precision = hit_count / max(1, len(candidate_targets)) * 100
-    print(f"\n  Recall   @Top{len(candidate_targets)}: {hit_count}/{len(true_zones)} = %{recall:.0f}")
-    print(f"  Precision@Top{len(candidate_targets)}: {hit_count}/{len(candidate_targets)} = %{precision:.0f}")
-    print(f"  Eşik: mesafe < zone_r * {distance_factor:.2f}")
+    print(f"\n  Recall   @Top{len(candidate_targets)}: {hit_count}/{len(true_zones)} = {recall:.0f}%")
+    print(f"  Precision@Top{len(candidate_targets)}: {hit_count}/{len(candidate_targets)} = {precision:.0f}%")
+    print(f"  Threshold: distance < zone_r * {distance_factor:.2f}")
     print(f"  {'─'*50}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# DOĞRUDAN ÇALIŞTIRMA
+# DIRECT EXECUTION
 # ─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == '__main__':
     import argparse
 
-    parser = argparse.ArgumentParser(description='GeoAI Gerçekçi Test')
+    parser = argparse.ArgumentParser(description='GeoAI Realistic Test')
     parser.add_argument('--scenario', default='porphyry_copper',
                         choices=RealisticGeoDataGenerator.SCENARIOS)
     parser.add_argument('--size',    type=int, default=400,
-                        help='Grid boyutu (NxN)')
+                        help='Grid size (NxN)')
     parser.add_argument('--wells',   type=int, default=80,
-                        help='Toplam kuyu sayısı')
+                        help='Total number of wells')
     parser.add_argument('--ratio',   type=float, default=15.0,
-                        help='neg/pos oranı (örn. 15 → %6 pozitif)')
+                        help='neg/pos ratio (e.g. 15 → ~6%% positive)')
     parser.add_argument('--seed', type=int, default=42,
-                        help='Rastgele tohum (deterministik veri üretimi)')
+                        help='Random seed (deterministic data generation)')
     parser.add_argument('--output-dir', default='output_realistic',
-                        help='Çıktı klasörü')
+                        help='Output directory')
     parser.add_argument('--no-save-data', action='store_true',
-                        help='Üretilen test verisini diske kaydetme')
+                        help='Do not save the generated test data to disk')
     parser.add_argument('--no-run-geoai', action='store_true',
-                        help='Sadece veri üret, GeoAI pipeline çalıştırma')
+                        help='Only generate data; do not run the GeoAI pipeline')
     parser.add_argument('--no-plots', action='store_true')
     parser.add_argument('--no-save-plots', action='store_true',
-                        help='GeoAI çalışırken PNG çıktılarını kaydetme')
+                        help='Do not save PNG outputs while GeoAI runs')
     parser.add_argument('--formats', nargs='*',
                         choices=['surfer_grd', 'xyz', 'csv'],
-                        help='Kaydetme formatları (örn: --formats surfer_grd xyz csv)')
+                        help='Output formats to save (e.g. --formats surfer_grd xyz csv)')
     parser.add_argument('--homogeneous-grid', action='store_true',
-                        help='Katman bazlı çözünürlük/hizalama farklarını kapat')
+                        help='Disable per-layer resolution/alignment differences')
     parser.add_argument('--no-res-jitter', action='store_true',
-                        help='Katman çözünürlük farklarını kapat (aynı nx/ny)')
+                        help='Disable layer resolution differences (same nx/ny)')
     parser.add_argument('--no-align-jitter', action='store_true',
-                        help='Katman hizalama ofsetlerini kapat')
+                        help='Disable layer alignment offsets')
     args = parser.parse_args()
 
     run_realistic_test(
