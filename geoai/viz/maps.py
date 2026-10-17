@@ -16,7 +16,7 @@ import numpy as np
 from matplotlib.colors import LinearSegmentedColormap
 from matplotlib.lines import Line2D
 
-from geoai.core.preprocessor import detect_layer_type
+from geoai.core.preprocessor import detect_layer_type, looks_geographic
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -86,12 +86,41 @@ def _km_label(val, _):
     return f"{val/1000:.1f}"
 
 
+def _is_geographic(coregistrar) -> bool:
+    """
+    Lon/lat reference grid? Uses coregistrar.geographic when the caller has set
+    it (GeoAIPipeline does, from the layer CRS), else the coordinate heuristic.
+    """
+    flag = getattr(coregistrar, 'geographic', None)
+    if flag is not None:
+        return bool(flag)
+    return looks_geographic(coregistrar.ref_x, coregistrar.ref_y)
+
+
 def _fmt_ax(ax, coregistrar=None):
-    """Axis labels: km for projected (metre) coordinates, raw units otherwise."""
+    """
+    Axis labels and limits: km for projected (metre) coordinates, degrees for
+    lon/lat grids (aspect corrected by 1/cos(latitude)), raw units otherwise.
+    The axes are limited to the reference grid extent so that points far
+    outside it (e.g. wells beyond the survey) cannot shrink the map.
+    """
     use_km = True
-    if coregistrar is not None and coregistrar.ref_x is not None:
-        span = max(np.ptp(coregistrar.ref_x), np.ptp(coregistrar.ref_y))
-        use_km = span >= 5000
+    geographic = False
+    if coregistrar is not None and getattr(coregistrar, 'ref_x', None) is not None:
+        rx, ry = np.asarray(coregistrar.ref_x), np.asarray(coregistrar.ref_y)
+        geographic = _is_geographic(coregistrar)
+        span = max(np.ptp(rx), np.ptp(ry))
+        use_km = span >= 5000 and not geographic
+        hx = abs(rx[1] - rx[0]) / 2 if rx.size > 1 else 0.5
+        hy = abs(ry[1] - ry[0]) / 2 if ry.size > 1 else 0.5
+        ax.set_xlim(rx.min() - hx, rx.max() + hx)
+        ax.set_ylim(ry.min() - hy, ry.max() + hy)
+    if geographic:
+        ax.set_xlabel('Longitude (°)', color=MUTED, fontsize=7)
+        ax.set_ylabel('Latitude (°)', color=MUTED, fontsize=7)
+        lat_c = 0.5 * (float(coregistrar.ref_y[0]) + float(coregistrar.ref_y[-1]))
+        ax.set_aspect(1.0 / max(np.cos(np.radians(lat_c)), 1e-3), adjustable='box')
+        return
     if use_km:
         ax.xaxis.set_major_formatter(mticker.FuncFormatter(_km_label))
         ax.yaxis.set_major_formatter(mticker.FuncFormatter(_km_label))
@@ -132,9 +161,13 @@ def _finalize(fig, save_path, show):
     return fig
 
 
-def _plot_targets(ax, targets, limit=10):
+def _plot_targets(ax, targets, limit=10, outlines=True):
     for t in targets[:limit]:
         color = TARGET_COLORS[min(t['rank'] - 1, len(TARGET_COLORS) - 1)]
+        ring = t.get('outline') if outlines else None
+        if ring is not None and len(ring) >= 4:
+            ring = np.asarray(ring, dtype=float)
+            ax.plot(ring[:, 0], ring[:, 1], color=color, lw=0.9, alpha=0.9, zorder=9)
         ax.scatter(t['x'], t['y'], c=color, s=130, marker='*',
                    edgecolors='white', linewidths=0.7, zorder=10)
         ax.annotate(f"T{t['rank']}", (t['x'], t['y']), textcoords='offset points',
@@ -280,7 +313,10 @@ def plot_prospectivity(
             colors_c = ['#aaccff', '#ffdd88', '#ff8844', '#ff2222']
             cs = ax2.contour(X, Y, pm, levels=levels, colors=colors_c,
                              linewidths=[0.6, 0.9, 1.2, 1.8], alpha=0.85)
-            ax2.clabel(cs, fmt=lambda v: f"{v*100:.0f}%", fontsize=6.5, inline=True)
+            # Unsupervised P is an area rank: 0.88 → "top 12 %" of the valid area
+            fmt = (lambda v: f"top {round(100 * (1 - v))}%") if unsup else \
+                (lambda v: f"{v*100:.0f}%")
+            ax2.clabel(cs, fmt=fmt, fontsize=6.5, inline=True)
         except (ValueError, TypeError):
             pass
     _plot_targets(ax2, targets)
@@ -320,6 +356,16 @@ def plot_prospectivity(
 # TARGET REPORT
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _target_label(t) -> str:
+    """'T1 (Pri 2)' for supervised targets, 'T1 (U)' when there is no priority class."""
+    if 'priority' not in t:
+        return f"T{t['rank']}"
+    p = t['priority']
+    if p is None or (isinstance(p, float) and np.isnan(p)):
+        return f"T{t['rank']} (U)"
+    return f"T{t['rank']} (Pri {int(p)})"
+
+
 def plot_target_report(
     targets: list,
     target_type: str = 'generic',
@@ -327,16 +373,27 @@ def plot_target_report(
     feature_importances=None,
     save_path: str = None,
     show: bool = True,
+    mode: str = None,
 ):
     """
     Report panel with the target list, CV metrics and feature importances.
+
+    mode: 'supervised' | 'unsupervised' (None → inferred from the targets);
+          unsupervised targets are labelled 'U' (no priority class) and their
+          values are shown as a favourability index.
     """
+    if mode is None:
+        mode = (targets[0].get('mode') if targets else None) or 'supervised'
+    unsup = mode != 'supervised'
+    p_name = 'Favorability' if unsup else 'Probability'
+
     n_panels = 2 + (1 if feature_importances is not None else 0) + \
         (1 if cv_results else 0)
     fig = plt.figure(figsize=(5.6 * n_panels, 5.6), facecolor=DARK_BG, layout='constrained')
     axes = np.atleast_1d(fig.subplots(1, n_panels))
 
-    fig.suptitle(f'GeoAI Target Report — {target_type.upper()}',
+    fig.suptitle(f'GeoAI Target Report — {target_type.upper()}' +
+                 ('  (unsupervised: U = no priority class)' if unsup else ''),
                  color=TEXT_COLOR, fontsize=13, fontweight='bold')
     panel = 0
 
@@ -347,8 +404,7 @@ def plot_target_report(
     ax.set_title('TARGET PRIORITY RANKING', color=TEXT_COLOR, fontweight='bold')
 
     if targets:
-        ranks = [f"T{t['rank']}" + (f" (Pri {t['priority']})" if 'priority' in t else '')
-                 for t in targets]
+        ranks = [_target_label(t) for t in targets]
         probs = [t['max_probability'] for t in targets]
         scores = [t['max_score'] for t in targets]
         uncs = [t['mean_uncertainty'] for t in targets]
@@ -358,7 +414,7 @@ def plot_target_report(
                       for i in range(len(ranks))]
 
         ax.barh(y_pos, probs, color=bar_colors, alpha=0.8, height=0.6,
-                label='Maximum Probability', edgecolor='#333')
+                label=f'Maximum {p_name}', edgecolor='#333')
         ax.barh(y_pos, scores, color=bar_colors, alpha=0.4, height=0.6,
                 label='Confidence Score', edgecolor='none')
         ax.barh(y_pos, uncs, color='gray', alpha=0.6, height=0.2, label='Uncertainty')
@@ -366,9 +422,10 @@ def plot_target_report(
         ax.set_yticks(y_pos)
         ax.set_yticklabels(ranks, color=TEXT_COLOR, fontsize=8)
         ax.set_xlim(0, 1.12)
-        ax.set_xlabel('Probability / Score', color=MUTED)
-        ax.axvline(0.60, color='yellow', ls='--', lw=1, alpha=0.6)
-        ax.axvline(0.75, color='orange', ls='--', lw=1, alpha=0.6)
+        ax.set_xlabel(f'{p_name} / Score', color=MUTED)
+        if not unsup:                                # priority cut-offs (LR 1.5 and 3)
+            ax.axvline(0.60, color='yellow', ls='--', lw=1, alpha=0.6)
+            ax.axvline(0.75, color='orange', ls='--', lw=1, alpha=0.6)
         ax.legend(fontsize=7, facecolor=PANEL_BG, labelcolor=MUTED, loc='lower right')
         for yp, p in zip(y_pos, probs):
             ax.text(p + 0.01, yp, f'{p:.3f}', va='center', color=TEXT_COLOR, fontsize=7.5)
@@ -385,7 +442,9 @@ def plot_target_report(
     if targets:
         xs = np.array([t['x'] for t in targets])
         ys = np.array([t['y'] for t in targets])
-        use_km = max(np.ptp(xs), np.ptp(ys), 0) >= 5000 or np.abs(xs).max() > 1e5
+        geographic = looks_geographic(xs, ys)
+        use_km = not geographic and (max(np.ptp(xs), np.ptp(ys), 0) >= 5000 or
+                                     np.abs(xs).max() > 1e5)
         scale = 1000.0 if use_km else 1.0
         areas = np.array([max(t['area_km2'], 1e-6) for t in targets])
         sizes = 60 + 600 * np.sqrt(areas / areas.max())
@@ -393,7 +452,7 @@ def plot_target_report(
         sc = ax.scatter(xs / scale, ys / scale, c=[t['max_probability'] for t in targets],
                         s=sizes, cmap=PROSP_CMAP, vmin=0, vmax=1,
                         edgecolors='white', linewidths=0.7, alpha=0.9)
-        _colorbar(fig, sc, ax, 'Probability')
+        _colorbar(fig, sc, ax, p_name)
         for t in targets:
             ax.annotate(
                 f"T{t['rank']}", (t['x'] / scale, t['y'] / scale),
@@ -402,9 +461,13 @@ def plot_target_report(
                 fontsize=8.5, fontweight='bold',
             )
         ax.margins(0.2)
-        unit = ' (km)' if use_km else ''
-        ax.set_xlabel('X' + unit, color=MUTED)
-        ax.set_ylabel('Y' + unit, color=MUTED)
+        if geographic:
+            ax.set_xlabel('Longitude (°)', color=MUTED)
+            ax.set_ylabel('Latitude (°)', color=MUTED)
+        else:
+            unit = ' (km)' if use_km else ''
+            ax.set_xlabel('X' + unit, color=MUTED)
+            ax.set_ylabel('Y' + unit, color=MUTED)
 
     # ── Panel 2: Feature Importance (optional) ────────────────────────────
     if feature_importances is not None and panel < len(axes):
@@ -496,8 +559,8 @@ def plot_multi_target_comparison(
                            shading='auto', vmin=0, vmax=1)
         _colorbar(fig, im, ax)
         _plot_targets(ax, res['targets'], limit=6)
-        ax.set_title(f'{typ.upper()}{tag}\nProbability', color=TEXT_COLOR,
-                     fontweight='bold', fontsize=10)
+        ax.set_title(f'{typ.upper()}{tag}\n' + ('Favorability' if unsup else 'Probability'),
+                     color=TEXT_COLOR, fontweight='bold', fontsize=10)
         _fmt_ax(ax, coregistrar)
 
         ax2 = axes[1][col]

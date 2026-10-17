@@ -19,6 +19,24 @@ def test_combine_targets_keeps_per_type_rank():
     assert len(df) == 5
     assert sorted(df.loc[df.target_type == 'groundwater', 'rank']) == [1, 2, 3]
     assert sorted(df['global_rank']) == [1, 2, 3, 4, 5]
+    assert (df['mode'] == 'supervised').all()
+
+
+def test_global_rank_only_among_supervised_targets():
+    unsup = _targets('geothermal', 2)
+    for t in unsup:
+        t['mode'] = 'unsupervised'
+        t['priority'] = None
+        t['max_score'] = 0.99                     # would outrank everything if mixed
+    df = combine_targets({'mineral': _targets('mineral', 2), 'geothermal': unsup})
+    geo = df[df.target_type == 'geothermal']
+    assert geo['global_rank'].isna().all() and geo['priority'].isna().all()
+    assert sorted(df.loc[df.target_type == 'mineral', 'global_rank']) == [1, 2]
+    assert str(df['priority'].dtype) == 'Int64'
+    # mode from the `modes` argument when the targets carry none
+    df2 = combine_targets({'geothermal': _targets('geothermal', 1)},
+                          modes={'geothermal': 'unsupervised'})
+    assert df2['mode'].tolist() == ['unsupervised'] and df2['global_rank'].isna().all()
 
 
 def test_save_target_report_files(tmp_path):
