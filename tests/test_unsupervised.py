@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 
 from geoai.models.unsupervised import (
-    generic_anomaly_maps, knowledge_driven_maps, percentile_scale,
+    generic_anomaly_maps, knowledge_driven_maps, percentile_scale, rank_scale,
 )
 
 
@@ -32,8 +32,8 @@ def test_generic_matches_equation_28():
     rng = np.random.default_rng(0)
     st = rng.normal(size=(10, 10, 4))
     p, u = generic_anomaly_maps(st)
-    np.testing.assert_allclose(p, percentile_scale(np.mean(np.abs(st), axis=-1)), rtol=1e-6)
-    np.testing.assert_allclose(u, percentile_scale(np.std(st, axis=-1)), rtol=1e-6)
+    np.testing.assert_allclose(p, rank_scale(np.mean(np.abs(st), axis=-1)), rtol=1e-6)
+    np.testing.assert_allclose(u, rank_scale(np.std(st, axis=-1)), rtol=1e-6)
 
 
 def test_knowledge_driven_is_target_specific():

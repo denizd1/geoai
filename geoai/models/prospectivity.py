@@ -27,7 +27,8 @@ Multi-layered solution:
      Applied only to the training folds, never to the validation fold.
 
   4. CALIBRATION FOR THE MLP
-     MLP + Platt (sigmoid) calibration (CalibratedClassifierCV).
+     MLP + Platt (sigmoid) calibration (CalibratedClassifierCV), fitted with the
+     same balanced weights as the other models.
 
   5. THRESHOLD OPTIMIZATION
      A fixed 0.5 threshold does not work on imbalanced data.
@@ -37,20 +38,32 @@ Multi-layered solution:
      w_m = PR-AUC_m / Σ PR-AUC (Σ w = 1). Uncertainty: weighted standard
      deviation across models U = sqrt(Σ w_m (p_m − P)²).
 
-  7. SPATIAL (WELL-GROUPED) CROSS-VALIDATION
-     Buffer pixels of the same well are assigned to the same fold (StratifiedGroupKFold).
-     This prevents the optimistic metric inflation (spatial leakage) caused by
-     neighbouring pixels appearing in both training and validation.
+  7. SPATIAL (WELL-CLUSTER) CROSS-VALIDATION
+     Buffer pixels of the same well — and of all wells closer to it than the
+     group distance (single-linkage clusters, default 2·max(r+, r−)) — are
+     assigned to the same fold (StratifiedGroupKFold). This prevents the
+     optimistic metric inflation (spatial leakage) caused by neighbouring pixels
+     of the same well or well cluster appearing in both training and validation.
+
+Meaning of the probabilities
+----------------------------
+All models are trained with balanced class weights (and SMOTE), so the
+ensemble output P is the posterior probability of a target under EQUAL class
+priors. Equivalently P / (1 − P) is the likelihood ratio of the evidence,
+LR = p(evidence | target) / p(evidence | background). The true posterior for
+a prior target fraction π is P·π / (P·π + (1 − P)(1 − π)), which needs π —
+usually unknown in exploration — so GeoAI reports P as is. Priority classes
+use LR cut-offs: P ≥ 0.75 ⇔ LR ≥ 3, P ≥ 0.60 ⇔ LR ≥ 1.5. The CV Brier score is
+class-balanced for the same reason.
 """
 
-import inspect
 import warnings
 from pathlib import Path
 
 import joblib
 import numpy as np
 import pandas as pd
-from scipy.ndimage import distance_transform_edt, label as nd_label
+from scipy.ndimage import find_objects, label as nd_label
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.ensemble import HistGradientBoostingClassifier, RandomForestClassifier
 from sklearn.metrics import (
@@ -255,7 +268,7 @@ def find_optimal_threshold(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _disk_offsets(radius_px: float) -> np.ndarray:
-    """(dr, dc) offsets inside a disk of radius radius_px."""
+    """(dr, dc) offsets inside a disk of radius radius_px (square cells)."""
     r = max(0.0, float(radius_px))
     ri = int(np.floor(r))
     dr, dc = np.mgrid[-ri:ri + 1, -ri:ri + 1]
@@ -263,26 +276,89 @@ def _disk_offsets(radius_px: float) -> np.ndarray:
     return np.column_stack([dr[keep], dc[keep]])
 
 
+def _disk_pixels(row_f: float, col_f: float, radius: float, cx: float, cy: float,
+                 ny: int, nx: int) -> tuple:
+    """
+    Grid cells whose centre lies within `radius` of the (fractional) position
+    (row_f, col_f), with physical cell sizes cx (columns) and cy (rows):
+    ((r − row_f)·cy)² + ((c − col_f)·cx)² ≤ radius². Cells outside the grid are
+    dropped. Returns (rows, cols) as int arrays.
+    """
+    radius = max(0.0, float(radius))
+    tol = 1e-9 * max(1.0, radius)
+    hr, hc = radius / cy + 1e-9, radius / cx + 1e-9
+    r0, r1 = max(0, int(np.ceil(row_f - hr))), min(ny - 1, int(np.floor(row_f + hr)))
+    c0, c1 = max(0, int(np.ceil(col_f - hc))), min(nx - 1, int(np.floor(col_f + hc)))
+    if r0 > r1 or c0 > c1:
+        return np.empty(0, dtype=int), np.empty(0, dtype=int)
+    rr, cc = np.mgrid[r0:r1 + 1, c0:c1 + 1]
+    keep = ((rr - row_f) * cy) ** 2 + ((cc - col_f) * cx) ** 2 <= (radius + tol) ** 2
+    return rr[keep].astype(int), cc[keep].astype(int)
+
+
+def _connected_groups(points: np.ndarray, distance) -> np.ndarray:
+    """
+    Single-linkage clustering: points closer than or equal to `distance` (directly
+    or through a chain of such neighbours) share a group. Returns group ids
+    0..k-1 (one group per point when distance is None or ≤ 0).
+    """
+    n = len(points)
+    if n == 0:
+        return np.empty(0, dtype=np.int64)
+    if distance is None or not np.isfinite(distance) or distance <= 0 or n == 1:
+        return np.arange(n, dtype=np.int64)
+    from scipy.sparse import coo_matrix
+    from scipy.sparse.csgraph import connected_components
+    from scipy.spatial import cKDTree
+
+    pairs = cKDTree(points).query_pairs(r=float(distance) * (1 + 1e-9), output_type='ndarray')
+    if len(pairs) == 0:
+        return np.arange(n, dtype=np.int64)
+    adj = coo_matrix((np.ones(len(pairs)), (pairs[:, 0], pairs[:, 1])), shape=(n, n))
+    _, comp = connected_components(adj, directed=False)
+    return comp.astype(np.int64)
+
+
 class WellSampler:
     """
     Extracts pixel training samples from well locations.
 
-    Labelling rule (technical report, equation 16):
+    Labelling rule (technical report, equation 16), with distances measured
+    from the exact well position in physical units:
       y(s) = 1  if the distance to a positive well is ≤ r+
       y(s) = 0  if (not positive and) the distance to a negative well is ≤ r−
-      extra negatives: random pixels at least d_min away from positive wells
+      extra negatives: random pixels at least d_min away from EVERY positive
+                       well, including wells just outside the grid
                        (pseudo-absence).
-    Every sample carries a group ID: well pixels belong to their own well's group,
-    extra negatives are pooled into spatial blocks (for spatial CV).
+    Wells outside the grid still label the grid cells their buffer reaches. A
+    well inside the grid always labels at least its nearest cell.
+
+    Spatial CV groups: wells (of either class) closer than `group_distance` are
+    merged into one group by single-linkage clustering, so that clustered wells
+    (prospect clusters, fences, twin holes) cannot sit on both sides of a CV
+    split. Extra negatives are pooled into spatial blocks.
 
     Parameters
     ----------
-    positive_buffer / negative_buffer : buffer radius (pixels)
-    positive_radius / negative_radius : buffer radius (coordinate units);
-                                        overrides the pixel value if given
+    positive_buffer / negative_buffer : buffer radius in cells. For non-square
+                                        cells a cell is the geometric-mean cell
+                                        size sqrt(|dx·dy|); the buffer is a
+                                        physical disk, not a pixel-space disk.
+    positive_radius / negative_radius : buffer radius in distance units (see
+                                        cell_size); overrides the cell value
     extra_negatives                   : number of random extra negatives
     extra_negative_min_distance       : minimum distance of extra negatives from
-                                        positive wells (pixels; None → max(4·r+, 8))
+                                        positive wells, in (geometric-mean) cells;
+                                        None → max(4·r+, 8 cells)
+    group_distance                    : 'auto' (default) → 2 · max(r+, r−);
+                                        a number → that distance (distance units);
+                                        None → one CV group per well
+    cell_size                         : (dx, dy) of a grid cell in the distance
+                                        units of the radii; None → the grid
+                                        spacing in map units. For lon/lat grids
+                                        pass coregistrar.filter_cell_size() so
+                                        that radii are in metres.
+    verbose                           : print the sampling summary
     """
 
     def __init__(
@@ -294,7 +370,12 @@ class WellSampler:
         positive_radius: float = None,
         negative_radius: float = None,
         extra_negative_min_distance: float = None,
+        group_distance='auto',
+        cell_size=None,
+        verbose: bool = True,
     ):
+        if isinstance(group_distance, str) and group_distance != 'auto':
+            raise ValueError(f"group_distance must be 'auto', None or a number, got {group_distance!r}")
         self.positive_buffer = positive_buffer
         self.negative_buffer = negative_buffer
         self.extra_negatives = int(extra_negatives)
@@ -302,13 +383,25 @@ class WellSampler:
         self.positive_radius = positive_radius
         self.negative_radius = negative_radius
         self.extra_negative_min_distance = extra_negative_min_distance
+        self.group_distance  = group_distance
+        self.cell_size       = cell_size
+        self.verbose         = verbose
         self.last_info = {}
 
-    def _radius_px(self, radius_units, buffer_px, coregistrar) -> float:
+    def _cell_size(self, coregistrar) -> tuple:
+        if self.cell_size is not None:
+            cx, cy = (float(abs(v)) for v in self.cell_size)
+        else:
+            cx, cy = abs(float(coregistrar.dx)), abs(float(coregistrar.dy))
+        if not (cx > 0 and cy > 0 and np.isfinite(cx) and np.isfinite(cy)):
+            raise ValueError(f"Invalid cell size ({cx}, {cy}).")
+        return cx, cy
+
+    @staticmethod
+    def _radius(radius_units, buffer_cells, cell_geo) -> float:
         if radius_units is None:
-            return float(buffer_px)
-        cell = min(abs(coregistrar.dx), abs(coregistrar.dy))
-        return float(radius_units) / cell
+            return float(buffer_cells) * cell_geo
+        return float(radius_units)
 
     def sample(
         self,
@@ -323,62 +416,95 @@ class WellSampler:
         rng = np.random.RandomState(self.random_state)
         if valid_mask is None:
             valid_mask = np.ones((ny, nx), dtype=bool)
+        valid_mask = np.asarray(valid_mask, dtype=bool)
+
+        cx, cy = self._cell_size(coregistrar)
+        cell_geo = float(np.sqrt(cx * cy))
+        r_pos = self._radius(self.positive_radius, self.positive_buffer, cell_geo)
+        r_neg = self._radius(self.negative_radius, self.negative_buffer, cell_geo)
 
         labels = np.full((ny, nx), -1, dtype=np.int8)
         groups = np.full((ny, nx), -1, dtype=np.int64)
 
         wells = well_df.reset_index(drop=True)
-        r_pos = self._radius_px(self.positive_radius, self.positive_buffer, coregistrar)
-        r_neg = self._radius_px(self.negative_radius, self.negative_buffer, coregistrar)
-
-        rows, cols, inside = coregistrar.transform_points(
-            wells['x'].values, wells['y'].values, return_mask=True
-        )
+        wx = wells['x'].values.astype(float)
+        wy = wells['y'].values.astype(float)
         lbl = wells['label'].values.astype(int)
+        finite = np.isfinite(wx) & np.isfinite(wy)
+        if not finite.all():
+            warnings.warn(f"{int((~finite).sum())} well(s) with non-finite coordinates were skipped.",
+                          UserWarning)
+
+        # Exact (fractional) grid positions and physical coordinates of the wells
+        col_f = (wx - coregistrar.ref_x[0]) / coregistrar.dx
+        row_f = (wy - coregistrar.ref_y[0]) / coregistrar.dy
+        rows_n, cols_n, inside = coregistrar.transform_points(wx, wy, return_mask=True)
+        inside = inside & finite
+        phys = np.column_stack([np.nan_to_num(col_f) * cx, np.nan_to_num(row_f) * cy])
+
+        # CV groups: single-linkage clustering of the wells in physical units
+        if self.group_distance == 'auto':
+            group_distance = 2.0 * max(r_pos, r_neg)
+        elif self.group_distance is None:
+            group_distance = None
+        else:
+            group_distance = float(self.group_distance)
+        well_group = np.full(len(wells), -1, dtype=np.int64)
+        well_group[finite] = _connected_groups(phys[finite], group_distance)
+        n_well_groups = int(well_group.max()) + 1 if finite.any() else 0
+
         info = {
             'n_pos_wells': int((lbl == 1).sum()), 'n_neg_wells': int((lbl == 0).sum()),
             'n_pos_outside': int(((lbl == 1) & ~inside).sum()),
             'n_neg_outside': int(((lbl == 0) & ~inside).sum()),
-            'positive_radius_px': r_pos, 'negative_radius_px': r_neg,
+            'cell_size': (cx, cy),
+            'positive_radius': r_pos, 'negative_radius': r_neg,
+            'positive_radius_px': r_pos / cell_geo, 'negative_radius_px': r_neg / cell_geo,
+            'group_distance': group_distance,
         }
-        for cls, name in ((1, 'positive'), (0, 'negative')):
-            n_out = info['n_pos_outside' if cls == 1 else 'n_neg_outside']
-            if n_out:
-                warnings.warn(f"{n_out} {name} well(s) fell outside the grid and were skipped.",
-                              UserWarning)
 
-        def _stamp(order_cls, radius_px):
-            offsets = _disk_offsets(radius_px)
+        def _stamp(order_cls, radius):
             used = 0
-            for i in np.nonzero((lbl == order_cls) & inside)[0]:
-                rr = rows[i] + offsets[:, 0]
-                cc = cols[i] + offsets[:, 1]
-                ok = (rr >= 0) & (rr < ny) & (cc >= 0) & (cc < nx)
-                rr, cc = rr[ok], cc[ok]
+            outside_used = 0
+            for i in np.nonzero((lbl == order_cls) & finite)[0]:
+                rr, cc = _disk_pixels(row_f[i], col_f[i], radius, cx, cy, ny, nx)
+                if inside[i]:                       # always label the nearest cell
+                    rr = np.append(rr, rows_n[i])
+                    cc = np.append(cc, cols_n[i])
+                if rr.size == 0:
+                    continue
                 free = (labels[rr, cc] == -1) & valid_mask[rr, cc]
                 if free.any():
                     labels[rr[free], cc[free]] = order_cls
-                    groups[rr[free], cc[free]] = i
+                    groups[rr[free], cc[free]] = well_group[i]
                     used += 1
-            return used
+                    outside_used += int(not inside[i])
+            return used, outside_used
 
         # Positives first (precedence as in equation 16), then negatives
-        info['n_pos_wells_used'] = _stamp(1, r_pos)
-        info['n_neg_wells_used'] = _stamp(0, r_neg)
+        info['n_pos_wells_used'], n_pos_out_used = _stamp(1, r_pos)
+        info['n_neg_wells_used'], n_neg_out_used = _stamp(0, r_neg)
+        for cls, name, used_out in ((1, 'positive', n_pos_out_used), (0, 'negative', n_neg_out_used)):
+            n_out = info['n_pos_outside' if cls == 1 else 'n_neg_outside']
+            if n_out:
+                extra = (f" ({used_out} of them still label cells through their buffer)"
+                         if used_out else "")
+                warnings.warn(f"{n_out} {name} well(s) lie outside the grid{extra}.", UserWarning)
 
-        # Extra random negatives: valid, unlabelled pixels far from positive wells
-        min_dist = self.extra_negative_min_distance
-        if min_dist is None:
-            min_dist = max(4 * r_pos, 8)
-        pos_centers = np.zeros((ny, nx), dtype=bool)
-        sel = (lbl == 1) & inside
-        pos_centers[rows[sel], cols[sel]] = True
-        if pos_centers.any():
-            dist = distance_transform_edt(~pos_centers)
+        # Extra random negatives: valid, unlabelled cells far from ALL positive wells
+        if self.extra_negative_min_distance is None:
+            min_dist = max(4.0 * r_pos, 8.0 * cell_geo)
         else:
-            dist = np.full((ny, nx), np.inf)
-        cand = np.flatnonzero((labels.ravel() == -1) & valid_mask.ravel() &
-                              (dist.ravel() >= min_dist))
+            min_dist = float(self.extra_negative_min_distance) * cell_geo
+        info['extra_negative_min_distance'] = min_dist
+        cand = np.flatnonzero((labels.ravel() == -1) & valid_mask.ravel())
+        pos_sel = (lbl == 1) & finite
+        if cand.size and pos_sel.any() and min_dist > 0:
+            from scipy.spatial import cKDTree
+            cr_, cc_ = np.unravel_index(cand, (ny, nx))
+            pts = np.column_stack([cc_ * cx, cr_ * cy])
+            d, _ = cKDTree(phys[pos_sel]).query(pts, k=1, distance_upper_bound=min_dist)
+            cand = cand[d >= min_dist]          # beyond the bound → inf
         n_extra = min(self.extra_negatives, len(cand))
         if n_extra < self.extra_negatives:
             warnings.warn(
@@ -387,11 +513,13 @@ class WellSampler:
             )
         if n_extra > 0:
             chosen = rng.choice(cand, size=n_extra, replace=False)
-            cr, cc = np.unravel_index(chosen, (ny, nx))
-            block = max(8, int(round(2 * min_dist)))
-            n_bx = (nx + block - 1) // block
-            labels[cr, cc] = 0
-            groups[cr, cc] = len(wells) + (cr // block) * n_bx + (cc // block)
+            er, ec = np.unravel_index(chosen, (ny, nx))
+            block = max(8.0 * cell_geo, 2.0 * min_dist)
+            brow = max(1, int(np.ceil(block / cy)))
+            bcol = max(1, int(np.ceil(block / cx)))
+            n_bx = (nx + bcol - 1) // bcol
+            labels[er, ec] = 0
+            groups[er, ec] = n_well_groups + (er // brow) * n_bx + (ec // bcol)
         info['n_extra_negatives'] = int(n_extra)
 
         sel_r, sel_c = np.nonzero(labels >= 0)
@@ -399,18 +527,22 @@ class WellSampler:
         y = labels[sel_r, sel_c].astype(int)
         g = groups[sel_r, sel_c]
 
-        finite = np.isfinite(X).all(axis=1)
-        X, y, g = X[finite], y[finite], g[finite]
-        info.update({'n_samples': int(len(y)), 'n_pos_samples': int(y.sum()),
-                     'n_neg_samples': int((y == 0).sum())})
+        ok = np.isfinite(X).all(axis=1)
+        X, y, g = X[ok], y[ok], g[ok]
+        info.update({
+            'n_samples': int(len(y)), 'n_pos_samples': int(y.sum()),
+            'n_neg_samples': int((y == 0).sum()),
+            'n_groups': int(len(np.unique(g))), 'n_pos_groups': int(len(np.unique(g[y == 1]))),
+        })
         self.last_info = info
 
         if len(y) == 0:
             warnings.warn("No usable well samples found within the grid.", UserWarning)
-        else:
+        elif self.verbose:
             print(
                 f"  ✓ Samples: {len(y)} pixels | Positive: {y.sum()} "
-                f"({info['n_pos_wells_used']} wells) | Negative: {(y == 0).sum()} "
+                f"({info['n_pos_wells_used']} wells, {info['n_pos_groups']} CV groups) | "
+                f"Negative: {(y == 0).sum()} "
                 f"({info['n_neg_wells_used']} wells + {n_extra} extra) | "
                 f"Ratio: {(y == 0).sum() / max(1, y.sum()):.1f}:1"
             )
@@ -455,9 +587,6 @@ def apply_feature_weights(X, feature_names, target_type):
 # ─────────────────────────────────────────────────────────────────────────────
 # 6. MODEL BUILDERS
 # ─────────────────────────────────────────────────────────────────────────────
-
-_MLP_ACCEPTS_SW = 'sample_weight' in inspect.signature(MLPClassifier.fit).parameters
-
 
 def _build_ann(n_features: int, imb: ImbalanceAnalyzer) -> CalibratedClassifierCV:
     hidden = (max(64, n_features*2), max(32, n_features), max(16, n_features//2))
@@ -511,24 +640,74 @@ def _build_gb(imb: ImbalanceAnalyzer) -> HistGradientBoostingClassifier:
 
 
 def _fit_model(name: str, clf, X, y):
-    """Applies class weighting through a single mechanism (no double weighting)."""
-    if name == 'ann' and _MLP_ACCEPTS_SW:
-        clf.fit(X, y, sample_weight=compute_sample_weight('balanced', y))
+    """
+    Applies class weighting through a single mechanism (no double weighting).
+
+    RF/GB use their class_weight parameter. The ANN (CalibratedClassifierCV)
+    receives balanced sample weights; on scikit-learn versions whose MLP cannot
+    take sample weights they are used by the Platt calibrator only, which still
+    maps the output to the equal-prior scale shared by all models.
+    """
+    if name == 'ann':
+        with warnings.catch_warnings():
+            warnings.filterwarnings('ignore', message='.*sample.weight.*', category=UserWarning)
+            clf.fit(X, y, sample_weight=compute_sample_weight('balanced', y))
     else:
-        # RF/GB: class_weight parameter; MLP on older sklearn: unweighted (SMOTE only)
         clf.fit(X, y)
     return clf
 
 
 def _safe_metrics(y, p) -> dict:
+    """
+    ROC-AUC, PR-AUC (average precision) and the CLASS-BALANCED Brier score.
+
+    The Brier score uses balanced sample weights (each class contributes half),
+    matching the equal-prior meaning of the model probabilities (see
+    GeoProspectivityModel.predict_proba_flat); an unweighted Brier score would
+    penalise equal-prior probabilities for the imbalance of the samples.
+    """
     try:
         return {
             'auc_roc': round(float(roc_auc_score(y, p)), 4),
             'auc_pr':  round(float(average_precision_score(y, p)), 4),
-            'brier':   round(float(brier_score_loss(y, p)), 4),
+            'brier':   round(float(brier_score_loss(
+                y, p, sample_weight=compute_sample_weight('balanced', y))), 4),
         }
     except ValueError:
         return {'auc_roc': 0.0, 'auc_pr': 0.0, 'brier': 1.0}
+
+
+def _component_outline(rows, cols, x0, y0, gx, gy) -> list:
+    """
+    Closed ring [[x, y], ...] (counter-clockwise) of the convex hull of the cell
+    corners of a component, in map coordinates. Only the first and last cell of
+    each row can be hull vertices, so only their corners are passed to qhull.
+    rows/cols must be in row-major order (as returned by np.nonzero).
+    """
+    rows = np.asarray(rows)
+    cols = np.asarray(cols)
+    starts = np.flatnonzero(np.r_[True, rows[1:] != rows[:-1]])
+    ends = np.r_[starts[1:] - 1, rows.size - 1]
+    r = rows[starts].astype(float)
+    c_lo = cols[starts].astype(float) - 0.5
+    c_hi = cols[ends].astype(float) + 0.5
+    pc = np.concatenate([c_lo, c_lo, c_hi, c_hi])
+    pr = np.concatenate([r - 0.5, r + 0.5, r - 0.5, r + 0.5])
+    pts = np.unique(np.column_stack([x0 + pc * gx, y0 + pr * gy]), axis=0)
+    try:
+        from scipy.spatial import ConvexHull
+        ring = pts[ConvexHull(pts).vertices]
+        # Counter-clockwise in map coordinates (qhull orders vertices CCW in the
+        # input space; a negative gx/gy would flip it, so check the signed area)
+        area2 = np.sum(ring[:, 0] * np.roll(ring[:, 1], -1) - np.roll(ring[:, 0], -1) * ring[:, 1])
+        if area2 < 0:
+            ring = ring[::-1]
+    except Exception:
+        xmin, ymin = pts.min(axis=0)
+        xmax, ymax = pts.max(axis=0)
+        ring = np.array([[xmin, ymin], [xmax, ymin], [xmax, ymax], [xmin, ymax]])
+    ring = np.vstack([ring, ring[:1]])
+    return [[float(x), float(y)] for x, y in ring]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -798,6 +977,10 @@ class GeoProspectivityModel:
         """
         Returns: (ensemble P, {model: p_m}, uncertainty U)
         P = Σ w_m p_m ;  U = sqrt(Σ w_m (p_m − P)²)   (Σ w_m = 1)
+
+        P is the posterior probability under equal class priors (balanced
+        training), so P / (1 − P) is the likelihood ratio of the evidence; see
+        the module docstring. U is the model disagreement on the same scale.
         """
         if not self.is_trained:
             raise RuntimeError("Model has not been trained.")
@@ -825,28 +1008,41 @@ class GeoProspectivityModel:
         valid_mask: np.ndarray = None,
     ) -> tuple:
         """
-        Prediction over the full grid. Pixels where valid_mask is False are returned as NaN.
-        Returns: (prob_map, uncertainty_map, {model: prob_map})
+        Prediction over the full grid.
+
+        Pixels where valid_mask is False, or where any feature is NaN/inf, are
+        not predicted and come back as NaN in every output map.
+        Returns: (prob_map, uncertainty_map, {model: prob_map}) — float32 maps.
         """
+        feature_stack_norm = np.asarray(feature_stack_norm)
         ny, nx, nf = feature_stack_norm.shape
         n_total = ny * nx
+        X_all = feature_stack_norm.reshape(-1, nf)
+        ok = np.isfinite(X_all).all(axis=1)
+        if valid_mask is not None:
+            valid_mask = np.asarray(valid_mask, dtype=bool)
+            if valid_mask.shape != (ny, nx):
+                raise ValueError(f"valid_mask shape {valid_mask.shape} != grid shape {(ny, nx)}")
+            ok &= valid_mask.ravel()
+        idx = np.flatnonzero(ok)
         if verbose:
-            print(f"  Grid: {ny}×{nx} = {n_total:,} pixels | Threshold: {self.optimal_threshold:.3f}")
+            print(f"  Grid: {ny}×{nx} = {n_total:,} pixels ({idx.size:,} predicted) | "
+                  f"Threshold: {self.optimal_threshold:.3f}")
 
-        X_all = np.nan_to_num(feature_stack_norm.reshape(-1, nf).astype(np.float32))
-        ens_p = np.zeros(n_total, dtype=np.float32)
-        unc_p = np.zeros(n_total, dtype=np.float32)
-        pm_p  = {n: np.zeros(n_total, dtype=np.float32) for n in self.models}
+        ens_p = np.full(n_total, np.nan, dtype=np.float32)
+        unc_p = np.full(n_total, np.nan, dtype=np.float32)
+        pm_p  = {n: np.full(n_total, np.nan, dtype=np.float32) for n in self.models}
 
-        for s in range(0, n_total, batch_size):
-            e = min(s + batch_size, n_total)
-            ens, pm, unc = self.predict_proba_flat(X_all[s:e])
-            ens_p[s:e] = ens
-            unc_p[s:e] = unc
+        for s in range(0, idx.size, batch_size):
+            sl = idx[s:s + batch_size]
+            ens, pm, unc = self.predict_proba_flat(X_all[sl].astype(np.float32))
+            ens_p[sl] = ens
+            unc_p[sl] = unc
             for n, p in pm.items():
-                pm_p[n][s:e] = p
+                pm_p[n][sl] = p
             if verbose:
-                print(f"    {100*e/n_total:.0f}% complete...", end='\r')
+                print(f"    {100 * min(s + batch_size, idx.size) / max(1, idx.size):.0f}% "
+                      "complete...", end='\r')
 
         if verbose:
             print("    100% complete.               ")
@@ -854,12 +1050,6 @@ class GeoProspectivityModel:
         prob = ens_p.reshape(ny, nx)
         unc = unc_p.reshape(ny, nx)
         per_model = {n: p.reshape(ny, nx) for n, p in pm_p.items()}
-        if valid_mask is not None:
-            invalid = ~np.asarray(valid_mask, dtype=bool)
-            prob[invalid] = np.nan
-            unc[invalid] = np.nan
-            for p in per_model.values():
-                p[invalid] = np.nan
         return prob, unc, per_model
 
     def get_top_targets(
@@ -869,11 +1059,15 @@ class GeoProspectivityModel:
         coregistrar,
         n_targets: int = 15,
         min_prob: float = None,
-        min_distance_pixels: int = 10,
+        min_distance_pixels: float = 10,
         uncertainty_penalty: float = 0.3,
         min_pixels: int = 3,
         percentile: float = 80.0,
         connectivity: int = 4,
+        assign_priority: bool = True,
+        cell_area_km2: float = None,
+        cell_size=None,
+        outlines: bool = True,
     ) -> list:
         """
         Extracts target zones from the probability map.
@@ -882,20 +1076,38 @@ class GeoProspectivityModel:
         components (4- or 8-connectivity). For each component, the centroid
         weighted by the score S = clip(P − λU, 0, 1) (snapped to the nearest
         component pixel if it falls outside the component) and the
-        highest-scoring pixel (peak) are reported. Components are sorted by
-        max_score; those closer to each other than min_distance_pixels are
-        discarded.
+        highest-scoring pixel (peak) are reported. Components are ranked by
+        (max_score, mean_probability, n_pixels), descending; a component whose
+        centroid is closer than min_distance_pixels to a better-ranked target
+        (Euclidean distance in physical units, measured in geometric-mean cells
+        sqrt(|dx·dy|)) is discarded.
 
-        Priority class (technical report §14):
-          1: P_max ≥ 0.75 and U_mean ≤ 0.20
-          2: P_max ≥ 0.60 and U_mean ≤ 0.30   (if not class 1)
+        Priority class (technical report §14), on the equal-prior probability
+        scale (P/(1−P) is the likelihood ratio, see the module docstring):
+          1: P_max ≥ 0.75 (LR ≥ 3)   and U_mean ≤ 0.20
+          2: P_max ≥ 0.60 (LR ≥ 1.5) and U_mean ≤ 0.30   (if not class 1)
           3: all others
+        assign_priority=False sets 'priority' to None (e.g. for unsupervised
+        favourability maps, which are not probabilities).
+
+        cell_size     : (dx, dy) of a cell in metres (or any length unit) for the
+                        distance test and the area; None → the grid spacing in
+                        map units. Pass coregistrar.filter_cell_size() for
+                        lon/lat grids.
+        cell_area_km2 : area of one cell in km²; None → |dx·dy| / 1e6 from
+                        cell_size (i.e. metres assumed).
+        outlines      : add 'outline', the closed ring [[x, y], ...] of the convex
+                        hull of the component's cell corners in map coordinates.
         """
         prob_map = np.asarray(prob_map, dtype=np.float64)
         uncertainty_map = np.asarray(uncertainty_map, dtype=np.float64)
+        if prob_map.ndim != 2 or uncertainty_map.shape != prob_map.shape:
+            raise ValueError("prob_map and uncertainty_map must be 2-D arrays of the same shape.")
         ny, nx = prob_map.shape
         if min_prob is None:
             min_prob = self.optimal_threshold
+        if connectivity not in (4, 8):
+            raise ValueError(f"connectivity must be 4 or 8, got {connectivity}")
 
         finite = np.isfinite(prob_map)
         if not finite.any():
@@ -907,73 +1119,95 @@ class GeoProspectivityModel:
         structure = np.ones((3, 3), dtype=int) if connectivity == 8 else None
         candidate = finite & (prob_map >= threshold)
         labeled, n_comp = nd_label(candidate, structure=structure)
+        if n_comp == 0:
+            return []
 
-        dx = abs(coregistrar.ref_x[1] - coregistrar.ref_x[0])
-        dy = abs(coregistrar.ref_y[1] - coregistrar.ref_y[0])
+        gx = float(coregistrar.ref_x[1] - coregistrar.ref_x[0])     # map units
+        gy = float(coregistrar.ref_y[1] - coregistrar.ref_y[0])
+        if cell_size is None:
+            cx, cy = abs(gx), abs(gy)
+        else:
+            cx, cy = (abs(float(v)) for v in cell_size)
+        cell_km2 = float(cell_area_km2) if cell_area_km2 is not None else cx * cy / 1e6
+        min_dist = float(min_distance_pixels) * float(np.sqrt(cx * cy))
+        x0, y0 = float(coregistrar.ref_x[0]), float(coregistrar.ref_y[0])
 
+        sizes = np.bincount(labeled.ravel(), minlength=n_comp + 1)
         targets = []
-        for i in range(1, n_comp + 1):
-            mask = labeled == i
-            n_pix = int(mask.sum())
-            if n_pix < min_pixels:
+        for i, sl in enumerate(find_objects(labeled), start=1):
+            if sl is None or sizes[i] < min_pixels:
                 continue
-            rows, cols = np.nonzero(mask)
+            sub = labeled[sl] == i
+            rr, cc = np.nonzero(sub)                       # row-major order
+            rows = rr + sl[0].start
+            cols = cc + sl[1].start
+            n_pix = int(rows.size)
             probs_h  = prob_map[rows, cols]
             scores_h = score_map[rows, cols]
             unc_h    = unc[rows, cols]
 
             w = np.maximum(scores_h, 0) + 1e-10
             cr = int(np.clip(np.round(np.average(rows, weights=w)), 0, ny - 1))
-            cc = int(np.clip(np.round(np.average(cols, weights=w)), 0, nx - 1))
-            if not mask[cr, cc]:
-                k = int(np.argmin((rows - cr) ** 2 + (cols - cc) ** 2))
-                cr, cc = int(rows[k]), int(cols[k])
+            cc_ = int(np.clip(np.round(np.average(cols, weights=w)), 0, nx - 1))
+            if labeled[cr, cc_] != i:
+                k = int(np.argmin(((rows - cr) * cy) ** 2 + ((cols - cc_) * cx) ** 2))
+                cr, cc_ = int(rows[k]), int(cols[k])
             kp = int(np.argmax(scores_h))
             pr, pc = int(rows[kp]), int(cols[kp])
 
             p_max = float(probs_h.max())
             u_mean = float(unc_h.mean())
-            if p_max >= 0.75 and u_mean <= 0.20:
+            if not assign_priority:
+                priority = None
+            elif p_max >= 0.75 and u_mean <= 0.20:
                 priority = 1
             elif p_max >= 0.60 and u_mean <= 0.30:
                 priority = 2
             else:
                 priority = 3
 
-            targets.append({
+            t = {
                 'rank': 0,
-                'x': float(coregistrar.ref_x[cc]),
+                'x': float(coregistrar.ref_x[cc_]),
                 'y': float(coregistrar.ref_y[cr]),
-                'row': cr, 'col': cc,
+                'row': cr, 'col': cc_,
                 'peak_x': float(coregistrar.ref_x[pc]),
                 'peak_y': float(coregistrar.ref_y[pr]),
                 'max_probability':  p_max,
                 'mean_probability': float(probs_h.mean()),
                 'max_score':        float(scores_h.max()),
                 'mean_uncertainty': u_mean,
-                'area_km2':         float(n_pix * dx * dy / 1e6),
+                'area_km2':         float(n_pix * cell_km2),
                 'n_pixels':         n_pix,
                 'priority':         priority,
                 'target_type':      self.name,
                 'threshold_used':   float(threshold),
-            })
+            }
+            t['_component'] = (i, sl)
+            targets.append(t)
 
-        targets.sort(key=lambda t: t['max_score'], reverse=True)
+        targets.sort(key=lambda t: (t['max_score'], t['mean_probability'], t['n_pixels']),
+                     reverse=True)
         filtered = []
+        kept_xy = []
         for t in targets:
             if t['max_probability'] < min_prob:
                 continue
-            if not any(
-                abs(t['row'] - f['row']) < min_distance_pixels and
-                abs(t['col'] - f['col']) < min_distance_pixels
-                for f in filtered
-            ):
-                filtered.append(t)
+            px, py = t['col'] * cx, t['row'] * cy
+            if min_dist > 0 and any(np.hypot(px - qx, py - qy) < min_dist for qx, qy in kept_xy):
+                continue
+            filtered.append(t)
+            kept_xy.append((px, py))
             if len(filtered) >= n_targets:
                 break
 
-        for i, t in enumerate(filtered):
-            t['rank'] = i + 1
+        for k, t in enumerate(filtered):
+            t['rank'] = k + 1
+            i, sl = t.pop('_component')
+            if outlines:
+                rr, cc = np.nonzero(labeled[sl] == i)
+                t['outline'] = _component_outline(rr + sl[0].start, cc + sl[1].start,
+                                                  x0, y0, gx, gy)
         return filtered
 
     def save(self, filepath: str):
@@ -1049,7 +1283,12 @@ class MultiTargetProspector:
         return results
 
     def predict_all(self, feature_stack_norm, coregistrar, extract_targets: bool = True,
-                    valid_mask=None, **kwargs) -> dict:
+                    valid_mask=None, target_kwargs: dict = None, **kwargs) -> dict:
+        """
+        Predicts every trained target type.
+        target_kwargs: keyword arguments for get_top_targets; other keyword
+                       arguments go to predict_grid.
+        """
         results = {}
         for typ, model in self.models.items():
             if not self.is_trained.get(typ, False):
@@ -1057,7 +1296,8 @@ class MultiTargetProspector:
             print(f"\n  Prediction: {typ.upper()}")
             prob, unc, pm = model.predict_grid(feature_stack_norm, valid_mask=valid_mask,
                                                **kwargs)
-            targets = model.get_top_targets(prob, unc, coregistrar) if extract_targets else []
+            targets = model.get_top_targets(prob, unc, coregistrar, **(target_kwargs or {})) \
+                if extract_targets else []
             results[typ] = {
                 'prob_map': prob, 'uncertainty_map': unc,
                 'per_model_maps': pm, 'targets': targets,

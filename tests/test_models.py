@@ -98,8 +98,17 @@ def test_sampler_labels_precedence_groups_and_extra_negatives():
     assert info['n_neg_wells_used'] == 1
     assert info['n_extra_negatives'] == 25
     assert (y == 0).sum() == 5 + 25
-    assert len(np.unique(g[y == 1])) == 2
+    # The two positive wells (20 m apart) and the negative well between them are closer
+    # than the default group distance 2·r+ = 40 m → one CV group (no leakage between them)
+    assert len(np.unique(g[y == 1])) == 1
+    assert info['n_pos_groups'] == 1 and info['group_distance'] == pytest.approx(40.0)
     assert X.shape == (len(y), 3) and len(g) == len(y)
+    # group_distance=None → one group per well (previous behaviour)
+    sampler = WellSampler(positive_buffer=2, negative_buffer=1, extra_negatives=25,
+                          group_distance=None)
+    with pytest.warns(UserWarning, match='outside the grid'):
+        _, y2, g2 = sampler.sample(stack, wells, cr, return_groups=True)
+    assert len(np.unique(g2[y2 == 1])) == 2
 
 
 def test_sampler_respects_valid_mask_and_radius_units():

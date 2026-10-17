@@ -771,15 +771,19 @@ class GeoAIPipeline:
         # Resistivity (low = conductive = water/sulfide/clay)
         res = np.ones((ny, nx)) * 120
         res = res - gauss(312000, 4012000, 90, 1000)  # sulfide zone
-        res = res - gauss(306000, 4010000, 60, 800)   # groundwater
+        res = res - gauss(306000, 4010000, 60, 800)   # aquifer 1
+        res = res - gauss(308500, 4007000, 45, 700)   # aquifer 2 (in the gravity-low basin)
+        res = res - gauss(306000, 4016000, 35, 600)   # satellite sulfide zone
         res = gf(np.abs(res + rng.randn(ny, nx) * 8), sigma=2)
         # IP chargeability (high = sulfide/pyrite)
         ip = rng.randn(ny, nx) * 2
         ip = gf(np.abs(ip + gauss(312000, 4012000, 30, 800)
+                       + gauss(306000, 4016000, 14, 500)
                        + gauss(316000, 4006000, 15, 400)), sigma=1.5)
         # Geochemistry: Cu (ppm), Au (ppb)
         geo_cu = np.abs(rng.randn(ny, nx) * 15 + 20)
-        geo_cu = gf(geo_cu + gauss(312500, 4011500, 180, 1000), sigma=2)
+        geo_cu = gf(geo_cu + gauss(312500, 4011500, 180, 1000)
+                    + gauss(306000, 4016000, 70, 600), sigma=2)
         geo_au = np.abs(rng.randn(ny, nx) * 0.003 + 0.005)
         geo_au = gf(geo_au + gauss(311500, 4012500, 0.05, 800), sigma=2)
 
@@ -787,20 +791,26 @@ class GeoAIPipeline:
             'magnetic_tmi': mag, 'gravity_bouguer': grav, 'resistivity': res,
             'ip_chargeability': ip, 'geochemistry_cu': geo_cu, 'geochemistry_au': geo_au,
         }
+        # Two drilled prospects per supervised target type (a main and a satellite
+        # one), so that spatial CV can validate on a prospect it was not trained on.
         wells = {
             'mineral': pd.DataFrame({
-                'x': [312000, 311500, 312500, 313000, 311000,                  # Positive
-                      304000, 320000, 305000, 318000, 320000, 303000, 319000],  # Negative
+                'x': [312000, 311500, 312500, 313000, 311000,                  # Positive: main
+                      306000, 306400,                                          # Positive: satellite
+                      304000, 320000, 303000, 318000, 320000, 303000, 319000],  # Negative
                 'y': [4012000, 4012500, 4011500, 4013000, 4012000,
-                      4004000, 4004000, 4018000, 4018000, 4016000, 4010000, 4008000],
-                'label': [1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0],
+                      4016000, 4015700,
+                      4004000, 4004000, 4019000, 4018000, 4016000, 4010000, 4008000],
+                'label': [1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0],
             }),
             'groundwater': pd.DataFrame({
-                'x': [306000, 305500, 306500, 307000,                              # Positive
-                      312000, 318000, 303000, 320000, 304000, 316000],            # Negative
+                'x': [306000, 305500, 306500, 307000,                              # Positive: aquifer 1
+                      308500, 308900,                                              # Positive: aquifer 2
+                      312000, 318000, 303000, 320000, 302500, 316000],            # Negative
                 'y': [4010000, 4010500, 4009500, 4011000,
-                      4012000, 4004000, 4018000, 4018000, 4006000, 4016000],
-                'label': [1, 1, 1, 1, 0, 0, 0, 0, 0, 0],
+                      4007000, 4006600,
+                      4012000, 4004000, 4018000, 4018000, 4005000, 4016000],
+                'label': [1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0],
             }),
             # Geothermal: low resistivity + gravity low
             'geothermal': pd.DataFrame({

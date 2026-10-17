@@ -54,7 +54,7 @@ def full_run(demo, tmp_path_factory):
 def test_wells_split_by_target_type_column(full_run):
     pipe, _, _ = full_run
     assert set(pipe.wells) == {'mineral', 'groundwater'}
-    assert len(pipe.wells['mineral']) == 12 and len(pipe.wells['groundwater']) == 10
+    assert len(pipe.wells['mineral']) == 14 and len(pipe.wells['groundwater']) == 12
 
 
 def test_modes_and_results_structure(full_run):
@@ -67,9 +67,10 @@ def test_modes_and_results_structure(full_run):
         assert res['score_map'].shape == (N, N)
         assert np.nanmin(res['prob_map']) >= 0 and np.nanmax(res['prob_map']) <= 1
     m = results['mineral']
-    assert m['cv_info']['strategy'] == 'spatial'
+    # Main + satellite prospect: two independent positive groups → spatial CV
+    assert m['cv_info']['strategy'] == 'spatial' and m['cv_info']['n_pos_groups'] == 2
     assert set(m['cv_results']) == {'ann', 'rf', 'gb', 'ensemble'}
-    assert m['sampling']['n_pos_wells_used'] == 5
+    assert m['sampling']['n_pos_wells_used'] == 7 and m['sampling']['n_pos_groups'] == 2
 
 
 def test_mineral_target_found_at_known_anomaly(full_run):
@@ -108,7 +109,7 @@ def test_manifest_and_csv(full_run):
     manifest = json.load(open(glob.glob(str(out / '*_manifest_*.json'))[0], encoding='utf-8'))
     assert manifest['parameters']['target_types'] == ['mineral', 'geothermal']
     assert manifest['results']['mineral']['mode'] == 'supervised'
-    assert manifest['wells']['mineral'] == {'n': 12, 'n_pos': 5, 'n_neg': 7}
+    assert manifest['wells']['mineral'] == {'n': 14, 'n_pos': 7, 'n_neg': 7}
     assert len(manifest['layers']) == 6 and manifest['n_features'] == len(pipe.feature_names)
     assert 'geoai' in manifest['versions']
 
