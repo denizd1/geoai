@@ -136,22 +136,22 @@ def verify_geoai():
         sys.path.insert(0, script_dir)
 
     try:
-        from geoai.pipeline import GeoAIPipeline
-        from geoai.io.loaders import load_grid
-        from geoai.models.prospectivity import GeoProspectivityModel, ImbalanceAnalyzer
+        from geoai.pipeline import GeoAIPipeline  # noqa: F401
+        from geoai.io.loaders import load_grid  # noqa: F401
+        from geoai.models.prospectivity import GeoProspectivityModel, ImbalanceAnalyzer  # noqa: F401
         print("  ✓ geoai.pipeline")
         print("  ✓ geoai.io.loaders")
         print("  ✓ geoai.models.prospectivity")
         return True
     except ImportError as e:
         print(f"  ✗ GeoAI import hatası: {e}")
-        print(f"  → Bu scriptin geoai/ klasörüyle aynı dizinde olduğundan emin olun.")
-        print(f"  → Beklenen yapı:")
-        print(f"      proje/")
-        print(f"      ├── geoai/          ← paket klasörü")
-        print(f"      │   ├── pipeline.py")
-        print(f"      │   └── ...")
-        print(f"      └── setup_geoai.py  ← bu script")
+        print("  → Bu scriptin geoai/ klasörüyle aynı dizinde olduğundan emin olun.")
+        print("  → Beklenen yapı:")
+        print("      proje/")
+        print("      ├── geoai/          ← paket klasörü")
+        print("      │   ├── pipeline.py")
+        print("      │   └── ...")
+        print("      └── setup_geoai.py  ← bu script")
         return False
 
 
@@ -167,7 +167,7 @@ def run_quick_test():
 
     try:
         import numpy as np
-        from geoai.models.prospectivity import ImbalanceAnalyzer, geo_smote, GeoProspectivityModel
+        from geoai.models.prospectivity import ImbalanceAnalyzer, geo_smote
 
         # Dengesizlik analizi testi
         y = np.array([1]*5 + [0]*95)
@@ -223,22 +223,30 @@ def print_usage():
   ─────────────────────────────
   jupyter notebook geoai_notebook.ipynb
 
+  4. KOMUT SATIRI (JSON konfigürasyon):
+  ─────────────────────────────
+  python -m geoai template proje.json   # örnek konfigürasyon
+  python -m geoai run proje.json
+  python -m geoai info data/magnetic.grd
+
   Dosya formatları destekleniyor:
-    .grd   → Surfer ASCII/Binary, Geosoft
-    .tif   → GeoTIFF (rasterio ile)
-    .xyz   → XYZ metin dosyaları
-    .csv   → X,Y,Z sütunlu CSV
+    .grd   → Surfer ASCII / Binary 6 / Binary 7, Geosoft (Oasis Montaj),
+             GMT netCDF (rasterio ile)
+    .tif   → GeoTIFF (rasterio; yoksa Pillow + GeoTIFF etiketleri)
+    .ers   → ER Mapper
+    .asc   → ESRI ASCII Grid
+    .xyz / .csv / .dat / .txt → düzenli kafes veya dağınık nokta (interpolasyon)
 
   Örnek kuyu CSV:
-    X,Y,LABEL
-    312000,4012000,1    ← pozitif (maden/su bulundu)
-    320000,4018000,0    ← negatif (boş kuyu)
+    X,Y,LABEL,TARGET_TYPE
+    312000,4012000,1,mineral    ← pozitif (maden/su bulundu)
+    320000,4018000,0,mineral    ← negatif (boş kuyu)
 """)
 
 
 if __name__ == "__main__":
     print("\n  ╔══════════════════════════════════╗")
-    print("  ║  GeoAI v3.1 — Kurulum Scripti   ║")
+    print("  ║  GeoAI v3.2 — Kurulum Scripti   ║")
     print("  ╚══════════════════════════════════╝\n")
 
     check_python_version()

@@ -1,22 +1,21 @@
 """
 GeoAI — Gerçekçi Test Verisi Üreticisi
 ========================================
-Basit Gaussian blob'lar değil; gerçek jeofizik fizik formülleri:
+Basit Gaussian blob'lar yerine potansiyel alan fiziğine dayalı ileri modeller:
 
-  Manyetik : Nokta dipol + yayılmış cisim formülleri
-             Inclination/declination etkisi
-             RTP (Reduced to Pole) yaklaşımı
+  Manyetik : İndüklenmiş mıknatıslanmalı küre (eşdeğer dipol) TMI anomalisi,
+             ΔT = (μ₀/4π)·m·[3(f̂·r̂)² − 1]/r³ — inklinasyon/deklinasyon etkisi dahil
 
-  Gravite  : Bouguer plaka + küresel cisim formülleri
-             Yoğunluk kontrast modelleme
+  Gravite  : Küresel cisim (nokta kütle) ve sonlu genişlikte 2B yatay prizma
+             (sediman havzası) formülleri; yoğunluk kontrastı modelleme
 
-  Rezistivite: Çift katmanlı Wenner dizisi tepkisi
-               Düşük dirençli iletken zonu (kil/su/sülfür)
+  Rezistivite: İletken cisim üzerinde ampirik (eliptik geçişli) görünür
+               rezistivite haritası — düşük dirençli zon (kil/su/sülfür)
 
-  IP       : Chargeability = sülfür mineralizasyon proxy'si
+  IP       : Chargeability = sülfür mineralizasyon proxy'si (ampirik)
 
-  Jeokimya : Metalik anomali + arka plan gürültüsü
-             Log-normal dağılım (gerçek jeokimya böyle dağılır)
+  Jeokimya : Metalik anomali + log-normal arka plan
+             (gerçek jeokimya verisi log-normal dağılır)
 
 Gerçekçilik özellikleri:
   - Birden fazla jeolojik yapı (fay, damar, intüzyon)
@@ -35,6 +34,8 @@ from scipy.ndimage import gaussian_filter
 from scipy.interpolate import RegularGridInterpolator
 import warnings
 
+from geoai.io.writers import save_surfer_ascii_grd as _write_surfer_ascii
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # JEOFİZİK FİZİK FONKSİYONLARI
@@ -47,50 +48,65 @@ SCENARIO_TARGET_TYPE_MAP = {
     'geothermal': 'geothermal',
 }
 
-def magnetic_dipole(X, Y, cx, cy, depth, magnetization,
-                    inclination_deg=60, declination_deg=10):
-    """
-    Manyetize küresel cismin yüzeyde yarattığı toplam manyetik alan (TMI).
+MU0_OVER_4PI = 1e-7  # μ₀/4π  [T·m/A]
 
-    Formül: T = (μ₀/4π) * m * [3(m̂·r̂)r̂ - m̂] / r³
-    Basitleştirilmiş: TMI = F * (2sin²I - cos²I·cos²(D-A)) / r³
-    
-    I: inclination, D: declination, m: magnetizasyon momenti
+
+def magnetic_dipole(X, Y, cx, cy, depth, magnetization,
+                    inclination_deg=60, declination_deg=10, radius=None):
     """
+    İndüklenmiş mıknatıslanmalı küresel cismin (eşdeğer dipol) yüzeyde
+    yarattığı toplam alan anomalisi (TMI, nT).
+
+    B  = (μ₀/4π) · [3(m·r̂)r̂ − m] / r³
+    ΔT = f̂·B = (μ₀/4π) · m · [3(f̂·r̂)² − 1] / r³      (m ∥ f̂, indüklenmiş)
+
+    Koordinatlar: x doğu, y kuzey, z aşağı. Ana alan yönü
+    f̂ = (cos I · sin D, cos I · cos D, sin I); r = gözlem − kaynak = (dx, dy, −depth).
+
+    Parametreler
+    ------------
+    depth         : kaynak merkezinin derinliği (m, > 0)
+    magnetization : radius verilirse mıknatıslanma şiddeti M (A/m) → m = M·(4/3)πR³;
+                    radius None ise doğrudan dipol momenti m (A·m²)
+    radius        : küre yarıçapı (m); depth'ten küçük olmalı
+    """
+    if depth <= 0:
+        raise ValueError("depth pozitif olmalı.")
+    if radius is not None:
+        if not 0 < radius < depth:
+            raise ValueError("radius 0 ile depth arasında olmalı (küre yüzeyin altında).")
+        moment = magnetization * (4.0 / 3.0) * np.pi * radius**3
+    else:
+        moment = magnetization
+
     inc = np.radians(inclination_deg)
     dec = np.radians(declination_deg)
+    f_hat = np.array([np.cos(inc) * np.sin(dec), np.cos(inc) * np.cos(dec), np.sin(inc)])
 
-    dx = X - cx
-    dy = Y - cy
-    r_horiz = np.sqrt(dx**2 + dy**2)
-    r = np.sqrt(r_horiz**2 + depth**2)
-    r = np.maximum(r, depth * 0.1)  # singülerlik engelle
+    rx = X - cx
+    ry = Y - cy
+    rz = -float(depth)
+    r = np.sqrt(rx**2 + ry**2 + rz**2)
+    cos_fr = (f_hat[0] * rx + f_hat[1] * ry + f_hat[2] * rz) / r
 
-    # Azimut açısı
-    azimuth = np.arctan2(dx, dy)
-
-    # Toplam alan yaklaşımı
-    # Dipol anomalisi: TMI = M * [2sin²I - cos²I*cos²(azimuth-D)] / r³
-    term1 = 2 * np.sin(inc)**2
-    term2 = np.cos(inc)**2 * np.cos(azimuth - dec)**2
-    tmi = magnetization * depth**3 * (term1 - term2) / r**5 * 1e9  # nT
-
-    return tmi
+    delta_t = MU0_OVER_4PI * moment * (3 * cos_fr**2 - 1) / r**3   # Tesla
+    return delta_t * 1e9  # nT
 
 
 def gravity_sphere(X, Y, cx, cy, depth, density_contrast, radius):
     """
-    Küresel cismin Bouguer yerçekimi anomalisi.
-    
-    Δg = (4/3)π G ρ r³ * depth / (r_horiz² + depth²)^(3/2)
-    G = 6.674e-11 m³/(kg·s²)
+    Küresel cismin Bouguer yerçekimi anomalisi (mGal).
+
+    Δg = G · M · depth / (r_yatay² + depth²)^(3/2),   M = (4/3)π R³ Δρ
+    G = 6.674e-11 m³/(kg·s²). Küre tamamen yüzeyin altında olmalıdır (R < depth).
     """
+    if not 0 < radius < depth:
+        raise ValueError("radius 0 ile depth arasında olmalı (küre yüzeyin altında).")
     G = 6.674e-11
     dx = X - cx
     dy = Y - cy
     r_horiz2 = dx**2 + dy**2
     r3 = (r_horiz2 + depth**2)**(3/2)
-    r3 = np.maximum(r3, (depth * 0.1)**3)
 
     volume = (4/3) * np.pi * radius**3
     mass = density_contrast * volume  # kg/m³ * m³ = kg
@@ -101,26 +117,30 @@ def gravity_sphere(X, Y, cx, cy, depth, density_contrast, radius):
 
 def gravity_horizontal_slab(X, cx, half_width, depth_top, depth_bot, density_contrast):
     """
-    Yatay tabaka (slab) yerçekimi anomalisi — fay/sediman havzası için.
-    Talwani formülü basitleştirilmiş versiyonu.
+    Sonlu genişlikte yatay tabaka (2B dikdörtgen prizma) gravite anomalisi —
+    sediman havzası / alüvyon dolgusu için.
 
-    Not: Bu implementasyon y doğrultusunda sonsuz kabul edilen 2D slab modelidir.
-    Bu nedenle Y/cy parametreleri modele etki etmez; bilinçli olarak arayüzden
-    çıkarılmıştır.
+    Cisim x ∈ [cx − b, cx + b], z ∈ [z₁, z₂] aralığında ve y yönünde sonsuzdur:
+        Δg(x) = 2Gρ ∫∫ z / ((x − x')² + z²) dx' dz
+              = 2Gρ [F(u_b, z) − F(u_a, z)]_{z₁}^{z₂}
+        F(u, z) = z·arctan(u/z) + (u/2)·ln(u² + z²),   u = kenar_x − x
+    b → ∞ limitinde Bouguer plakası 2πGρ(z₂ − z₁) elde edilir.
+
+    Not: 2B model olduğu için Y koordinatı modele etki etmez.
     """
+    if not 0 < depth_top < depth_bot:
+        raise ValueError("0 < depth_top < depth_bot olmalı.")
     G = 6.674e-11
-    dx = X - cx
 
-    # 2D tabaka anomalisi (y yönünde sonsuz uzanan tabaka)
-    def _layer_contribution(z):
-        r = np.sqrt(dx**2 + z**2)
-        r = np.maximum(r, 1.0)
-        return 2 * G * density_contrast * (
-            half_width * z / (half_width**2 + z**2) +
-            np.arctan(half_width / (np.abs(dx) + 1e-3))
-        )
+    def _F(u, z):
+        return z * np.arctan(u / z) + 0.5 * u * np.log(u**2 + z**2)
 
-    dg = _layer_contribution(depth_top) - _layer_contribution(depth_bot)
+    u_b = (cx + half_width) - X
+    u_a = (cx - half_width) - X
+    dg = 2 * G * density_contrast * (
+        (_F(u_b, depth_bot) - _F(u_b, depth_top)) -
+        (_F(u_a, depth_bot) - _F(u_a, depth_top))
+    )
     return dg * 1e5  # mGal
 
 
@@ -425,29 +445,31 @@ class RealisticGeoDataGenerator:
 
         # ─ Manyetik ──────────────────────────────────────────────────────
         # Ana manyetit potasik alterasyon zonu
+        # Manyetit zonu: χ≈0.07 SI × H≈40 A/m → M≈3 A/m
         mag = magnetic_dipole(
-            X, Y, cx, cy, depth=300,
-            magnetization=5000, inclination_deg=55, declination_deg=5
+            X, Y, cx, cy, depth=400, radius=350,
+            magnetization=3.0, inclination_deg=55, declination_deg=5
         )
         # Propilitik halka (çevre düşük manyetik)
         mag += magnetic_dipole(
-            X, Y, cx + 800, cy + 600, depth=600,
-            magnetization=1500, inclination_deg=55, declination_deg=5
+            X, Y, cx + 800, cy + 600, depth=700, radius=500,
+            magnetization=0.8, inclination_deg=55, declination_deg=5
         )
         # Fay kontağı (manyetik doğrusal)
+        # Fay kontağı: iki blok arasında ~160 nT manyetik basamak (±80 nT)
         fault1 = create_fault_zone(X, Y, cx - 2000, cy, angle_deg=35, width=200, throw=80)
-        mag += gaussian_filter(fault1, sigma=3) * 20
+        mag += gaussian_filter(fault1, sigma=3)
         # Bölgesel arka plan
         regional_trend = -0.3 * (X - X.mean()) / X.std() + 0.2 * (Y - Y.mean()) / Y.std()
         mag += regional_trend * 50 + 200  # bölgesel alan
 
         # ─ Gravite ───────────────────────────────────────────────────────
         # Granitik intüzyon: hafif kaya (ρ_granite ≈ 2650 vs host ≈ 2800)
-        grav = gravity_sphere(X, Y, cx, cy, depth=500,
+        grav = gravity_sphere(X, Y, cx, cy, depth=1800,
                                density_contrast=-150, radius=intrusion_radius)
         # Yoğun cevherli zon
-        grav += gravity_sphere(X, Y, cx + 200, cy - 300, depth=200,
-                                density_contrast=300, radius=400)
+        grav += gravity_sphere(X, Y, cx + 200, cy - 300, depth=450,
+                                density_contrast=300, radius=300)
         # Bölgesel trend
         grav += 0.5 * (Y - Y.mean()) / (self.ny * self.cell_size) * 2
 
@@ -538,13 +560,16 @@ class RealisticGeoDataGenerator:
                 width=150, throw=100 + i * 30
             )
             faults.append(gaussian_filter(f, sigma=2))
+        # create_fault_zone bir basamak (±throw) döndürür; faya yakınlık için
+        # |f| küçük olan bant kullanılır: 1 = fay üzerinde, → 0 uzaklaştıkça
+        proximity = [np.exp(-np.abs(f) / 50.0) for f in faults]
 
         # Manyetik: Demagnetizasyon zonu (silisleşme)
         mag = np.ones_like(X) * 150  # bölgesel
         demag = create_intrusion(X, Y, cx, cy, rx=1200, ry=1800, angle_deg=25)
         mag -= demag * 120  # demagnetizasyon düşüğü
-        for f in faults:
-            mag += f * 15  # fay kenarı magnetik yüksek
+        for prox in proximity:
+            mag += 40 * prox  # fay boyunca doğrusal manyetik yüksek (~40 nT)
 
         # Rezistivite: Çok katmanlı yapı
         res = np.ones_like(X) * 200  # arka plan
@@ -554,18 +579,18 @@ class RealisticGeoDataGenerator:
         # Kil zonu altında: düşük rezistivite
         clay_zone = create_intrusion(X, Y, cx, cy, rx=1500, ry=2000, angle_deg=25)
         res = np.where(clay_zone > silica_cap, 15, res)
-        # Damar boyunca düşük rezistivite
-        for f in faults:
-            res -= np.abs(f) * 30
+        # Damar boyunca düşük rezistivite (fay zonunda değer %40'a düşer)
+        for prox in proximity:
+            res *= 1 - 0.6 * prox
 
         # IP: Düşük sülfürasyon → düşük IP (epitermali porfiriden ayırt eder)
         ip = np.ones_like(X) * 3  # düşük arka plan
-        for f in faults:
-            ip += np.exp(-np.abs(f) / 50) * 8  # damar IP halosu
+        for prox in proximity:
+            ip += 8 * prox  # damar IP halosu
 
         # Gravite: Silisleşme zonu yoğun
-        grav = gravity_sphere(X, Y, cx, cy, depth=200,
-                               density_contrast=100, radius=800)
+        grav = gravity_sphere(X, Y, cx, cy, depth=900,
+                               density_contrast=100, radius=700)
         grav += self.rng.standard_normal(X.shape) * 0.2  # ölçüm gürültüsü
 
         # Jeokimya
@@ -652,8 +677,8 @@ class RealisticGeoDataGenerator:
         # ─ Gravite ───────────────────────────────────────────────────────
         # Alüvyon dolgusu (düşük yoğunluk): gravite düşüğü
         grav = gravity_sphere(
-            X, Y, akifer1_cx, akifer1_cy, depth=50,
-            density_contrast=-200, radius=600
+            X, Y, akifer1_cx, akifer1_cy, depth=400,
+            density_contrast=-200, radius=350
         )
         grav += gravity_horizontal_slab(
             X, akifer2_cx,
@@ -666,8 +691,8 @@ class RealisticGeoDataGenerator:
         mag = gaussian_filter(self.rng.standard_normal(X.shape) * 5, sigma=3) + 100
         # Bazalt akifer tabanı: zayıf pozitif
         mag += magnetic_dipole(
-            X, Y, akifer2_cx, akifer2_cy, depth=300,
-            magnetization=500, inclination_deg=55
+            X, Y, akifer2_cx, akifer2_cy, depth=300, radius=250,
+            magnetization=0.3, inclination_deg=55
         )
 
         # ─ Jeokimya: Klorür ──────────────────────────────────────────────
@@ -713,9 +738,10 @@ class RealisticGeoDataGenerator:
         X, Y = self.X, self.Y
         cx, cy = self.x[self.nx//2], self.y[self.ny//2]
 
-        # Magma odası (derin, 5-10 km)
-        mag_chamber_depth = 5000
-        heat_source_depth  = 1500
+        # Isı kaynağının (sıcak, düşük yoğunluklu rezervuar) merkez derinliği.
+        # Derin magma odası (5-10 km) yüzeyde ölçülebilir kısa dalga boylu
+        # anomali üretmediği için ayrıca modellenmez.
+        heat_source_depth = 1500
 
         # ─ Rezistivite (en önemli!) ───────────────────────────────────────
         # Jeotermal rezervuar: 2-15 Ohm.m
@@ -748,21 +774,21 @@ class RealisticGeoDataGenerator:
         mag -= demag_zone * 200
         # Aktif volkanik kon: kuvvetli pozitif
         mag += magnetic_dipole(
-            X, Y, cx + 1000, cy + 800, depth=200,
-            magnetization=8000, inclination_deg=55
+            X, Y, cx + 1000, cy + 800, depth=300, radius=250,
+            magnetization=5.0, inclination_deg=55
         )
         # Genç lav akıntıları
         mag += magnetic_dipole(
-            X, Y, cx - 800, cy + 400, depth=50,
-            magnetization=3000, inclination_deg=55
+            X, Y, cx - 800, cy + 400, depth=80, radius=60,
+            magnetization=5.0, inclination_deg=55
         )
 
         # ─ Gravite ───────────────────────────────────────────────────────
         grav = gravity_sphere(X, Y, cx, cy, depth=heat_source_depth,
-                               density_contrast=-200, radius=2000)
+                               density_contrast=-200, radius=1200)
         # Yüzey hidrotermal tortul: negatif
-        grav += gravity_sphere(X, Y, cx + 200, cy - 300, depth=100,
-                                density_contrast=-150, radius=600)
+        grav += gravity_sphere(X, Y, cx + 200, cy - 300, depth=400,
+                                density_contrast=-150, radius=300)
         grav += gaussian_filter(self.rng.standard_normal(X.shape) * 0.15, sigma=8)
 
         # ─ Jeokimya ──────────────────────────────────────────────────────
@@ -994,29 +1020,11 @@ class RealisticGeoDataGenerator:
 def save_surfer_ascii_grd(grid, x, y, filepath):
     """
     Surfer ASCII GRD formatında kaydet (DSAA).
-    Surfer, Oasis Montaj ve diğer jeofizik yazılımlarda açılır.
+    Surfer, Oasis Montaj, QGIS ve diğer jeofizik yazılımlarda açılır.
+    NaN → Surfer blank (1.70141e38); değerler 10 anlamlı basamakla yazılır
+    (küçük jeokimya değerlerinde hassasiyet kaybı olmaz).
     """
-    ny, nx = grid.shape
-    # NaN → Surfer dummy
-    g = grid.copy().astype(float)
-    g[np.isnan(g)] = 1.70141e+38
-
-    xmin, xmax = x.min(), x.max()
-    ymin, ymax = y.min(), y.max()
-    valid = g[g < 1e30]
-    zmin = valid.min() if len(valid) else 0
-    zmax = valid.max() if len(valid) else 1
-
-    with open(filepath, 'w') as f:
-        f.write('DSAA\n')
-        f.write(f'{nx} {ny}\n')
-        f.write(f'{xmin:.6f} {xmax:.6f}\n')
-        f.write(f'{ymin:.6f} {ymax:.6f}\n')
-        f.write(f'{zmin:.6f} {zmax:.6f}\n')
-        # Veriyi satır satır yaz
-        for row in g:
-            f.write(' '.join(f'{v:.4f}' for v in row))
-            f.write('\n')
+    return _write_surfer_ascii(grid, x, y, filepath)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1078,7 +1086,7 @@ def save_test_dataset(
                 df_xyz = pd.DataFrame({
                     'X': X[mask], 'Y': Y[mask], 'Z': grid[mask]
                 })
-                df_xyz.to_csv(fp, index=False, sep='\t', float_format='%.4f')
+                df_xyz.to_csv(fp, index=False, sep='\t', float_format='%.10g')
                 saved.append(fp)
 
             elif fmt == 'csv':
@@ -1087,7 +1095,7 @@ def save_test_dataset(
                 mask = ~np.isnan(grid)
                 pd.DataFrame({
                     'X': X[mask], 'Y': Y[mask], 'value': grid[mask]
-                }).to_csv(fp, index=False, float_format='%.4f')
+                }).to_csv(fp, index=False, float_format='%.10g')
                 saved.append(fp)
 
     # Kuyu verisi
@@ -1218,7 +1226,7 @@ def _validate_targets(targets, true_zones, gen=None, top_k=10, distance_factor=2
     Kaç hedef gerçek zonu yakalamış?
     """
     print(f"\n  {'─'*50}")
-    print(f"  DOĞRULAMA: Tahmin vs Gerçek")
+    print("  DOĞRULAMA: Tahmin vs Gerçek")
     print(f"  {'─'*50}")
 
     if not targets:

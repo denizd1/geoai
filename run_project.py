@@ -5,6 +5,9 @@ Kendi jeofizik verilerinizle sistemi çalıştırmak için bu dosyayı düzenley
 
 Kullanım:
     python run_project.py
+
+Alternatif: aynı ayarları JSON dosyasında tutup komut satırından çalıştırın:
+    python -m geoai template proje.json   →   python -m geoai run proje.json
 """
 
 import sys
@@ -12,7 +15,8 @@ import os
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from geoai.pipeline import GeoAIPipeline
+from geoai.cli import print_targets  # noqa: E402
+from geoai.pipeline import GeoAIPipeline  # noqa: E402
 
 # ══════════════════════════════════════════════════════════════
 #  AYARLAR — Burası düzenlenecek
@@ -33,10 +37,15 @@ DEMO_SAVE_PLOTS = True
 #   'mineral'     → Maden/sülfür/altın
 #   'groundwater' → Yeraltı suyu
 #   'geothermal'  → Jeotermal
+#   'generic'     → Genel (tüm katmanlar eşit)
 HEDEF_TIPLERI = ["mineral", "groundwater"]  # ← düzenleyin
 
 # Jeofizik dosyalarınızın yolları
-# Desteklenen formatlar: .grd (Surfer/Geosoft), .tif (GeoTIFF), .xyz, .csv
+# Desteklenen formatlar: .grd (Surfer ASCII/6/7, Geosoft), .tif (GeoTIFF),
+#                        .ers (ER Mapper), .asc (ESRI ASCII), .xyz/.csv/.dat
+# Katman adı, katman tipini (manyetik, gravite, rezistivite, IP, jeokimya...)
+# belirler: örn. 'magnetic_tmi', 'mag_rtp', 'gravity_bouguer', 'resistivity',
+# 'ip_chargeability', 'geochemistry_cu' veya 'Cu_ppm'.
 KATMANLAR = {
     # 'katman_adi': 'dosya_yolu.grd',
     # Örnek:
@@ -56,6 +65,8 @@ XYZ_KOLON_AYARLARI = {
 
 # Kuyu / sondaj verisi (CSV)
 # Gerekli kolonlar: X (veya Easting), Y (veya Northing), LABEL (1=pozitif, 0=negatif)
+# Tek dosyada TARGET_TYPE kolonu varsa her hedef tipi için yalnızca ilgili
+# satırlar kullanılır (aynı dosyayı birden çok tip için verebilirsiniz).
 KUYU_DOSYALARI = {
     # 'mineral': 'data/wells_mineral.csv',
     # 'groundwater': 'data/wells_water.csv',
@@ -63,8 +74,16 @@ KUYU_DOSYALARI = {
 
 # Grid çözünürlüğü — büyük alan + yüksek çözünürlük = yavaş
 # Tipik değerler: 200x200 (hızlı), 500x500 (detaylı), 1000x1000 (yüksek res)
+# None → katmanlar arasındaki en ince hücre boyutu kullanılır
 GRID_NX = 300
 GRID_NY = 300
+
+# Hedef çıkarımı ve çıktı ayarları
+MIN_OLASILIK = None          # None = cross-validation ile bulunan optimal eşik
+BELIRSIZLIK_CEZASI = 0.3     # güven skoru S = P − λ·U için λ
+GRID_DISA_AKTAR = True       # P/U/S haritalarını Surfer GRD + GeoTIFF olarak yaz
+MODELLERI_KAYDET = False     # eğitilmiş modelleri output/models/*.joblib olarak sakla
+GRAFIKLERI_GOSTER = True
 
 # ══════════════════════════════════════════════════════════════
 #  ÇALIŞTIRMA — Genellikle burası değiştirilmez
@@ -89,31 +108,12 @@ if __name__ == "__main__":
             show_plots=DEMO_SHOW_PLOTS,
             save_plots=DEMO_SAVE_PLOTS,
         )
-
-        print("\n" + "═" * 60)
-        print("  DEMO HEDEF LİSTESİ")
-        print("═" * 60)
-        for tip, res in results.items():
-            targets = res.get("targets", [])
-            print(f"\n  [{tip.upper()}] — {len(targets)} hedef")
-            print(
-                f"  {'Sıra':<5} {'X':>12} {'Y':>12} {'Olasılık':>10} {'Skor':>10} {'Alan km²':>10}"
-            )
-            print(f"  {'─' * 55}")
-            for t in targets[:10]:
-                print(
-                    f"  {t['rank']:<5} "
-                    f"{t['x']:>12.1f} "
-                    f"{t['y']:>12.1f} "
-                    f"{t['max_probability']:>10.3f} "
-                    f"{t['max_score']:>10.3f} "
-                    f"{t['area_km2']:>10.3f}"
-                )
+        print_targets(results)
         sys.exit(0)
 
     if not KUYU_DOSYALARI:
         print("UYARI: Kuyu verisi tanımlanmamış.")
-        print("Sistem çalışmaya devam eder ama hedefler daha az güvenilir olur.")
+        print("Sistem denetimsiz (bilgi-güdümlü) modda çalışır; hedefler daha az güvenilir olur.")
 
     # Pipeline oluştur
     pipe = GeoAIPipeline(project_name=PROJE_ADI)
@@ -130,6 +130,14 @@ if __name__ == "__main__":
         for hedef_tipi, dosya in KUYU_DOSYALARI.items():
             pipe.add_wells(dosya, target_type=hedef_tipi)
 
+    if pipe.load_errors:
+        print("\nUYARI: Bazı dosyalar yüklenemedi:")
+        for _, hata in pipe.load_errors:
+            print(f"  - {hata}")
+    if not pipe.layers:
+        print("HATA: Hiçbir katman yüklenemedi. Dosya yollarını kontrol edin.")
+        sys.exit(1)
+
     # Çalıştır
     print("\nPipeline başlatılıyor...\n")
     results = pipe.run(
@@ -138,30 +146,14 @@ if __name__ == "__main__":
         target_ny=GRID_NY,
         common_extent="intersection",  # Tüm katmanların kesişim alanı
         n_targets=15,
-        min_prob=None,  # None = optimal threshold otomatik bulunur
+        min_prob=MIN_OLASILIK,
         cv_folds=5,
         output_dir=CIKTI_KLASORU,
-        show_plots=True,
+        show_plots=GRAFIKLERI_GOSTER,
         save_plots=True,
+        uncertainty_penalty=BELIRSIZLIK_CEZASI,
+        export_grids=GRID_DISA_AKTAR,
+        save_models=MODELLERI_KAYDET,
     )
 
-    # Hedef listesi
-    print("\n" + "═" * 60)
-    print("  HEDEF LİSTESİ")
-    print("═" * 60)
-    for tip, res in results.items():
-        targets = res["targets"]
-        print(f"\n  [{tip.upper()}] — {len(targets)} hedef")
-        print(
-            f"  {'Sıra':<5} {'X':>12} {'Y':>12} {'Olasılık':>10} {'Skor':>10} {'Alan km²':>10}"
-        )
-        print(f"  {'─' * 55}")
-        for t in targets[:10]:
-            print(
-                f"  {t['rank']:<5} "
-                f"{t['x']:>12.1f} "
-                f"{t['y']:>12.1f} "
-                f"{t['max_probability']:>10.3f} "
-                f"{t['max_score']:>10.3f} "
-                f"{t['area_km2']:>10.3f}"
-            )
+    print_targets(results)

@@ -43,5 +43,6 @@ if __name__ == "__main__":
                 f"  {target_type:12}: "
                 f"X={t['x']:.0f}  Y={t['y']:.0f}  "
                 f"P={t['max_probability']:.3f}  "
-                f"Alan={t['area_km2']:.2f} km²"
+                f"Alan={t['area_km2']:.2f} km²  "
+                f"Öncelik={t['priority']}"
             )
