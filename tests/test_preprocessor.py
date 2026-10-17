@@ -1,4 +1,4 @@
-"""Co-registration, NaN doldurma, katman tipi, feature ve normalizasyon testleri."""
+"""Tests for co-registration, NaN filling, layer type detection, features and normalization."""
 import numpy as np
 import pytest
 
@@ -21,7 +21,7 @@ def test_fill_nans_nearest_and_linear():
     np.testing.assert_allclose(fill_nans(h, 'linear')[2, 2], 12.0)
     assert fill_nans(h, 'nearest')[2, 2] in (7.0, 11.0, 13.0, 17.0)
 
-    # Seyrek örneklenmiş düzlem → 'auto' lineer seçer ve düzlemi tam üretir
+    # Sparsely sampled plane → 'auto' selects linear and reproduces the plane exactly
     Y, X = np.mgrid[0:30, 0:30]
     plane = 3.0 * X - 2.0 * Y + 1
     sparse = np.full(plane.shape, np.nan)
@@ -68,7 +68,7 @@ def test_intersection_extent_and_union_masks():
     cr = CoRegistrar().fit({'a': a, 'b': b}, target_nx=16, target_ny=11, common_extent='union')
     reg = cr.transform_all({'a': a, 'b': b})
     assert cr.ref_x[0] == 0 and cr.ref_x[-1] == 150
-    # 'a' yalnızca x ≤ 100'ü kapsar: dışı NaN olmalı (eski sürüm kenarı tekrarlıyordu)
+    # 'a' only covers x ≤ 100: everything outside must be NaN (the old version repeated the edge)
     assert np.isnan(reg['a'][:, cr.ref_x > 100]).all()
     assert np.isfinite(reg['a'][:, cr.ref_x <= 100]).all()
     assert cr.masks['a'][:, cr.ref_x > 100].all()
@@ -88,13 +88,13 @@ def test_nodata_holes_are_filled_but_masked():
 def test_no_overlap_raises():
     a = _layer([0, 1], [0, 1], np.zeros((2, 2)))
     b = _layer([5, 6], [0, 1], np.zeros((2, 2)))
-    with pytest.raises(ValueError, match='ortak alan'):
+    with pytest.raises(ValueError, match='No common area'):
         CoRegistrar().fit({'a': a, 'b': b})
 
 
 def test_max_pixels_cap_warns():
     a = _layer(np.linspace(0, 1, 3), np.linspace(0, 1, 3), np.zeros((3, 3)))
-    with pytest.warns(UserWarning, match='kırpılıyor'):
+    with pytest.warns(UserWarning, match='clipping'):
         cr = CoRegistrar().fit({'a': a}, target_nx=5000, target_ny=10)
     assert cr.ref_nx == 2000
 
@@ -104,14 +104,14 @@ def test_transform_points_nearest_cell():
     cr = CoRegistrar().fit({'a': a}, target_nx=11, target_ny=11)
     rows, cols, inside = cr.transform_points([3.4, 3.6, 10.4, 10.6], [0.2, 9.9, 5, 5],
                                              return_mask=True)
-    assert cols.tolist() == [3, 4, 10, 10]     # en yakın hücre (eski: searchsorted tavanı)
+    assert cols.tolist() == [3, 4, 10, 10]     # nearest cell (old: searchsorted ceiling)
     assert rows.tolist() == [0, 10, 5, 5]
     assert inside.tolist() == [True, True, True, False]
     x, y = cr.index_to_coords(rows, cols)
     assert x.tolist() == [3, 4, 10, 10]
 
 
-# ─── Katman tipi ────────────────────────────────────────────────────────────
+# ─── Layer type ─────────────────────────────────────────────────────────────
 
 @pytest.mark.parametrize('name,typ', [
     ('magnetic_tmi', 'magnetic'), ('mag_rtp', 'magnetic'), ('TMI', 'magnetic'),
@@ -137,7 +137,7 @@ def test_extract_features_profiles_shapes_and_types(rng):
     ny, nx = 40, 50
     layers = {'magnetic_tmi': rng.normal(size=(ny, nx)), 'geochemistry_cu': rng.normal(size=(ny, nx))}
     stack, names, maps = extract_features(layers, dx=100, dy=100, verbose=False)
-    n_mag = len(LAYER_FILTER_PROFILES['magnetic']) + 2          # 'stats' → 3 feature
+    n_mag = len(LAYER_FILTER_PROFILES['magnetic']) + 2          # 'stats' → 3 features
     n_geo = len(LAYER_FILTER_PROFILES['geochemistry']) + 2
     assert stack.shape == (ny, nx, n_mag + n_geo)
     assert stack.dtype == np.float32
@@ -167,7 +167,7 @@ def test_extract_features_fills_nan(rng):
 
 def test_normalizer_median_iqr_and_clip(rng):
     X = rng.normal(loc=50, scale=10, size=(10000, 2)).astype(np.float32)
-    X[0, 0] = 1e6                                    # uç değer
+    X[0, 0] = 1e6                                    # outlier
     Z = RobustGridNormalizer().fit_transform(X)
     assert abs(np.median(Z[:, 0])) < 0.02
     q25, q75 = np.percentile(Z[:, 1], [25, 75])
@@ -178,11 +178,11 @@ def test_normalizer_median_iqr_and_clip(rng):
 def test_normalizer_constant_and_degenerate_features():
     X = np.zeros((100, 2), dtype=np.float32)
     X[:95, 1] = 3.0
-    X[95:, 1] = 10.0                                 # IQR = 0 ama varyans > 0
+    X[95:, 1] = 10.0                                 # IQR = 0 but variance > 0
     Z = RobustGridNormalizer().fit_transform(X)
     assert np.isfinite(Z).all()
     assert np.all(Z[:, 0] == 0)
-    assert Z[95:, 1].max() < 5                       # 1e-10 bölmesiyle ±5'e sıkışmamalı
+    assert Z[95:, 1].max() < 5                       # must not be pinned to ±5 by a 1e-10 division
 
 
 def test_normalizer_preserves_nan_and_checks_shape(rng):
@@ -196,7 +196,7 @@ def test_normalizer_preserves_nan_and_checks_shape(rng):
 
 
 def test_stat_window_numerically_stable_for_large_offsets(rng):
-    g = 48000.0 + rng.normal(size=(30, 30))          # TMI benzeri büyük taban değer
+    g = 48000.0 + rng.normal(size=(30, 30))          # large TMI-like base value
     m, s, r = GeophysicalFilters.stat_window(g, window=5)
     i, j = 15, 15
     win = g[i - 2:i + 3, j - 2:j + 3]

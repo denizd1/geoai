@@ -94,7 +94,7 @@ class GeoAIRegressionTests(unittest.TestCase):
             import rasterio
             from rasterio.transform import from_origin
         except Exception:
-            self.skipTest("rasterio yüklü değil")
+            self.skipTest("rasterio is not installed")
 
         with tempfile.TemporaryDirectory() as td:
             tif_path = Path(td) / 'mini.tif'

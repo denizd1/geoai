@@ -1,29 +1,29 @@
 """
 geoai.models.unsupervised
 =========================
-Kuyu verisi olmadığında (veya denetimli eğitim mümkün olmadığında) kullanılan
-denetimsiz geri-düşüm (fallback) haritaları.
+Unsupervised fallback maps used when no well data are available (or when
+supervised training is not possible).
 
-İki mod vardır:
+There are two modes:
 
-1. GENEL ANOMALİ (teknik rapor, denklem 28) — hedef tipi 'generic' veya
-   hiçbir katman hedef tipinin bilgi tablosuyla eşleşmiyorsa:
+1. GENERIC ANOMALY (technical report, equation 28) — used when the target type
+   is 'generic' or no layer matches the target type's knowledge table:
        strength(s)   = (1/n_f) Σ_f |F(s, f)|
        dispersion(s) = std_f F(s, f)
        P = π[5,95](strength),  U = π[5,95](dispersion)
 
-2. BİLGİ-GÜDÜMLÜ (knowledge-driven) — hedef tipinin bilinen jeofizik imzası
-   kullanılır. Her katman için tek bir temsilci feature (robust z-skoru) alınır
-   ve yönlü kanıta çevrilir:
-       e_k(s) = +z   (yüksek değer olumlu, örn. IP / jeokimya)
-       e_k(s) = −z   (düşük değer olumlu, örn. yeraltı suyu için rezistivite)
-       e_k(s) = |z|  (yön belirsiz anomali, örn. maden için manyetik)
-   Skor = Σ w_k e_k / Σ w_k   (aynı tipteki katmanlar ağırlığı paylaşır)
-   U    = ağırlıklı kanıt dağılımı (katmanlar arası uyumsuzluk)
-   P ve U yüzdelik ölçeklemeyle [0, 1]'e taşınır.
+2. KNOWLEDGE-DRIVEN — the known geophysical signature of the target type is
+   used. A single representative feature (robust z-score) is taken per layer
+   and converted into directional evidence:
+       e_k(s) = +z   (high values favourable, e.g. IP / geochemistry)
+       e_k(s) = −z   (low values favourable, e.g. resistivity for groundwater)
+       e_k(s) = |z|  (anomaly of either sign, e.g. magnetics for mineral targets)
+   Score = Σ w_k e_k / Σ w_k   (layers of the same type share the weight)
+   U     = weighted spread of the evidence (disagreement between layers)
+   P and U are mapped to [0, 1] by percentile scaling.
 
-Not: Bu haritalar kalibre edilmiş olasılık DEĞİL, göreli elverişlilik
-(favorability) indeksidir; hedef sıralaması için kullanılır.
+Note: These maps are NOT calibrated probabilities but a relative favorability
+index; they are intended for ranking targets.
 """
 
 import numpy as np
@@ -31,7 +31,7 @@ import numpy as np
 from geoai.core.preprocessor import feature_layer_name, feature_layer_type
 
 
-# (ağırlık, yön): yön +1 yüksek olumlu, −1 düşük olumlu, 0 mutlak anomali
+# (weight, direction): direction +1 = high is favourable, −1 = low is favourable, 0 = absolute anomaly
 TARGET_EVIDENCE = {
     'mineral': {
         'ip': (2.0, +1), 'chargeability': (2.0, +1),
@@ -57,7 +57,7 @@ TARGET_EVIDENCE = {
     },
 }
 
-# Katman başına temsilci feature tercih sırası
+# Preference order for the representative feature of each layer
 _REPRESENTATIVE = {
     'resistivity': ('log', 'smooth', 'raw'),
     'conductivity': ('log', 'smooth', 'raw'),
@@ -67,7 +67,7 @@ _DEFAULT_REPRESENTATIVE = ('smooth', 'raw')
 
 
 def percentile_scale(arr: np.ndarray, lo: float = 5, hi: float = 95) -> np.ndarray:
-    """π[lo,hi] operatörü: değerleri [q_lo, q_hi] → [0, 1] aralığına taşır."""
+    """π[lo,hi] operator: maps values from [q_lo, q_hi] → [0, 1]."""
     arr = np.asarray(arr, dtype=np.float64)
     out = np.full(arr.shape, np.nan, dtype=np.float32)
     valid = np.isfinite(arr)
@@ -82,7 +82,7 @@ def percentile_scale(arr: np.ndarray, lo: float = 5, hi: float = 95) -> np.ndarr
 
 
 def generic_anomaly_maps(feature_stack_norm: np.ndarray) -> tuple:
-    """Denklem 28: genel anomali gücü ve feature dağılımı haritaları."""
+    """Equation 28: generic anomaly strength and feature dispersion maps."""
     finite = np.isfinite(feature_stack_norm).any(axis=-1)
     strength = np.full(feature_stack_norm.shape[:2], np.nan)
     dispersion = np.full(feature_stack_norm.shape[:2], np.nan)
@@ -94,7 +94,7 @@ def generic_anomaly_maps(feature_stack_norm: np.ndarray) -> tuple:
 
 
 def _representative_features(feature_names: list) -> dict:
-    """{katman_adı: (feature_index, katman_tipi)}"""
+    """{layer_name: (feature_index, layer_type)}"""
     by_layer = {}
     for i, fname in enumerate(feature_names):
         layer = feature_layer_name(fname)
@@ -116,9 +116,9 @@ def knowledge_driven_maps(
     valid_mask: np.ndarray = None,
 ) -> tuple:
     """
-    Hedef tipine özgü bilgi-güdümlü elverişlilik ve belirsizlik haritaları.
+    Target-type-specific knowledge-driven favorability and uncertainty maps.
 
-    Döndürür: (prob_map, uncertainty_map, info)
+    Returns: (prob_map, uncertainty_map, info)
       info: {'method': 'knowledge_driven' | 'generic_anomaly',
              'evidence': [{'layer', 'type', 'weight', 'direction'}, ...]}
     """
@@ -140,7 +140,7 @@ def knowledge_driven_maps(
     stack = np.asarray(feature_stack_norm, dtype=np.float64)
     if valid_mask is not None:
         stack = stack.copy()
-        stack[~np.asarray(valid_mask, dtype=bool)] = np.nan   # ölçekleme yalnızca geçerli alanda
+        stack[~np.asarray(valid_mask, dtype=bool)] = np.nan   # scale only within the valid area
 
     if not used:
         prob, unc = generic_anomaly_maps(stack)

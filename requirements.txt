@@ -1,18 +1,18 @@
-# GeoAI v3.2 — Gerekli Paketler
-# Kurulum: pip install -r requirements.txt
-#      veya (paket olarak): pip install -e .[geotiff]
+# GeoAI v3.2 — Required Packages
+# Install: pip install -r requirements.txt
+#      or (as a package): pip install -e .[geotiff]
 
-# Zorunlu
+# Required
 numpy>=1.21
 pandas>=1.3
 scipy>=1.7
-scikit-learn>=1.2   # HistGradientBoosting class_weight desteği için
-matplotlib>=3.5     # constrained layout için
-joblib>=1.1.1      # scikit-learn 1.2 gereksinimi
+scikit-learn>=1.2   # for HistGradientBoosting class_weight support
+matplotlib>=3.5     # for constrained layout
+joblib>=1.1.1      # required by scikit-learn 1.2
 
-# GeoTIFF / GDAL formatları ve GeoTIFF dışa aktarımı için (önerilir)
-# Windows'ta sorun çıkarsa: conda install rasterio
+# For GeoTIFF / GDAL formats and GeoTIFF export (recommended)
+# If it causes problems on Windows: conda install rasterio
 rasterio>=1.2
 
-# rasterio alternatifi (otomatik fallback: GeoTIFF etiketlerinden koordinat okur)
+# rasterio alternative (automatic fallback: reads coordinates from GeoTIFF tags)
 Pillow>=8.0

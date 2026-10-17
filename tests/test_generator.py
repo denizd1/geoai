@@ -1,4 +1,4 @@
-"""generate_test_data.py: ileri model fiziği ve veri kaydetme testleri."""
+"""generate_test_data.py: forward-model physics and data-saving tests."""
 import os
 import warnings
 
@@ -19,8 +19,8 @@ def test_slab_reaches_bouguer_limit_and_is_symmetric():
     x = np.linspace(-5000, 5000, 101)
     g = gtd.gravity_horizontal_slab(x, 0.0, 1000.0, 50.0, 300.0, -200.0)
     np.testing.assert_allclose(g, g[::-1], rtol=1e-10)
-    assert g[50] == g.min() < 0                       # merkez en negatif
-    assert abs(g[0]) < 0.1 * abs(g[50])               # uzakta sönümlenir
+    assert g[50] == g.min() < 0                       # centre is the most negative
+    assert abs(g[0]) < 0.1 * abs(g[50])               # decays with distance
 
 
 def test_slab_matches_numerical_integration():
@@ -54,7 +54,7 @@ def test_magnetic_dipole_pole_and_equator():
     eq = gtd.magnetic_dipole(np.array([0.0]), np.array([0.0]), 0, 0, d, M,
                              inclination_deg=0, declination_deg=0, radius=R)
     assert eq[0] == pytest.approx(-1e-7 * m / d ** 3 * 1e9)
-    # Kuzey yarımküre (I=55°): pozitif tepe kaynağın güneyine kayar, kuzeyde negatif lob
+    # Northern hemisphere (I=55°): the positive peak shifts south of the source, negative lobe to the north
     y = np.linspace(-3000, 3000, 601)
     prof = gtd.magnetic_dipole(np.zeros_like(y), y, 0, 0, d, M, inclination_deg=55,
                                declination_deg=0, radius=R)
@@ -92,7 +92,7 @@ def test_save_test_dataset_roundtrip(tmp_path):
         xyz = load_grid(str(tmp_path / 'resistivity.xyz'))
     np.testing.assert_allclose(grd['grid'], meta['grid'], rtol=1e-6, equal_nan=True)
     np.testing.assert_allclose(grd['x'], meta['x'])
-    # XYZ düğüm noktalarından kafes birebir yeniden kurulur
+    # The lattice is reconstructed exactly from the XYZ node points
     assert xyz['format'] == 'xyz_lattice'
     ix = np.searchsorted(meta['x'], xyz['x'] - 1e-6)
     iy = np.searchsorted(meta['y'], xyz['y'] - 1e-6)

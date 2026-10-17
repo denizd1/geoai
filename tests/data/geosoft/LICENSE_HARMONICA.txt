@@ -1,6 +1,6 @@
-Bu klasördeki Oasis Montaj (Geosoft) test grid'leri (om_*.grd) ve om_expected.npz
-(om_expected.nc'den dönüştürülmüştür) Harmonica projesinden alınmıştır:
-https://github.com/fatiando/harmonica (harmonica/tests/data, sürüm 0.7.0)
+The Oasis Montaj (Geosoft) test grids in this directory (om_*.grd) and om_expected.npz
+(converted from om_expected.nc) were taken from the Harmonica project:
+https://github.com/fatiando/harmonica (harmonica/tests/data, version 0.7.0)
 
 These Oasis Montaj (Geosoft) test grids (om_*.grd) and om_expected.npz (converted
 from om_expected.nc) are taken from the Harmonica project and redistributed under

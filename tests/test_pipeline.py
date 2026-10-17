@@ -1,4 +1,4 @@
-"""GeoAIPipeline entegrasyon testleri."""
+"""GeoAIPipeline integration tests."""
 import glob
 import json
 import os
@@ -23,7 +23,7 @@ def demo():
 
 @pytest.fixture(scope='module')
 def full_run(demo, tmp_path_factory):
-    """Dosyadan katman + karma TARGET_TYPE'lı kuyu CSV'si ile tam çalıştırma."""
+    """Full run with layers loaded from files and a well CSV with mixed TARGET_TYPE values."""
     root = tmp_path_factory.mktemp('full')
     data = root / 'data'
     for name, grid in demo['layers'].items():
@@ -36,7 +36,7 @@ def full_run(demo, tmp_path_factory):
     pd.concat(wells).rename(columns={'x': 'X', 'y': 'Y', 'label': 'LABEL'}).to_csv(
         data / 'wells.csv', index=False)
 
-    pipe = GeoAIPipeline(project_name='Test Proje/1')
+    pipe = GeoAIPipeline(project_name='Test Project/1')
     for path in sorted(glob.glob(str(data / '*.grd'))):
         pipe.add_layer(path)
     pipe.add_wells(str(data / 'wells.csv'))
@@ -91,8 +91,8 @@ def test_output_files(full_run):
     if HAS_RASTERIO:
         assert 'mineral_uncertainty.tif' in names
     assert all(os.path.exists(p) for p in pipe.output_files)
-    # Proje adı dosya adı için güvenli hale getirilmeli
-    assert glob.glob(str(out / 'Test_Proje_1_targets_*.csv'))
+    # The project name must be made safe for use in file names
+    assert glob.glob(str(out / 'Test_Project_1_targets_*.csv'))
 
 
 def test_exported_grid_matches_result(full_run):
@@ -163,12 +163,12 @@ def test_unsupervised_fallback_returns_requested_target_type(tmp_path):
     pipe = GeoAIPipeline(project_name='TestUnsup')
     grid = np.random.RandomState(42).randn(30, 30)
     pipe.add_layer_array(grid, np.linspace(0, 100, 30), np.linspace(0, 100, 30), 'magnetic_tmi')
-    with pytest.warns(UserWarning, match='kuyu verisi yok'):
+    with pytest.warns(UserWarning, match='No well data'):
         results = pipe.run(target_types=['mineral'], target_nx=30, target_ny=30, n_targets=3,
                            output_dir=str(tmp_path), show_plots=False, save_plots=False,
                            verbose=False)
     assert results['mineral']['mode'] == 'unsupervised'
-    assert results['mineral']['fallback_reason'] == 'kuyu verisi yok'
+    assert results['mineral']['fallback_reason'] == 'no well data'
     assert len(results['mineral']['targets']) <= 3
 
 
@@ -181,7 +181,7 @@ def test_add_layer_errors_are_recorded(tmp_path):
     with pytest.warns(UserWarning):
         pipe.add_layer(str(bad))
     assert len(pipe.load_errors) == 2
-    with pytest.raises(ValueError, match='katman eklenmemiş'):
+    with pytest.raises(ValueError, match='No layers have been added'):
         pipe.run(output_dir=str(tmp_path))
 
 
@@ -193,10 +193,10 @@ def test_add_layer_array_and_wells_validation():
         pipe.add_wells_dataframe(pd.DataFrame({'x': [1], 'y': [1]}))
     with pytest.raises(ValueError):
         pipe.add_wells_dataframe(pd.DataFrame({'x': [1], 'y': [1], 'label': [2]}))
-    with pytest.warns(UserWarning, match='atlandı'):
+    with pytest.warns(UserWarning, match='skipped'):
         pipe.add_wells_dataframe(pd.DataFrame({'x': [1, np.nan], 'y': [1, 2], 'label': [1, 0]}))
     pipe.add_wells_dataframe(pd.DataFrame({'x': [3], 'y': [3], 'label': [0]}))
-    assert len(pipe.wells['generic']) == 2           # ikinci çağrı eklendi
+    assert len(pipe.wells['generic']) == 2           # second call appended
 
 
 def test_crs_mismatch_warns():

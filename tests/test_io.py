@@ -1,4 +1,4 @@
-"""Grid okuyucu / yazıcı testleri (GDAL ve gerçek Oasis Montaj dosyalarıyla çapraz doğrulama)."""
+"""Grid reader/writer tests (cross-validated against GDAL and real Oasis Montaj files)."""
 import os
 import struct
 import warnings
@@ -87,7 +87,7 @@ def test_surfer6_binary_reader_handwritten(tmp_path):
 
 
 def test_surfer7_reader_skips_unknown_sections(tmp_path):
-    """FLTI gibi ek bölümler DATA'dan önce gelse de doğru okunmalı."""
+    """Must read correctly even when extra sections such as FLTI precede DATA."""
     ny, nx = 2, 3
     data = np.array([[1, 2, 3], [4, 5, 6]], dtype='<f8')
     path = tmp_path / 's7.grd'
@@ -161,7 +161,7 @@ def test_esri_ascii_center_registration(tmp_path):
     lyr = L.load_grid(str(path))
     np.testing.assert_allclose(lyr['x'], [10, 15])
     np.testing.assert_allclose(lyr['y'], [20, 25])
-    assert np.isnan(lyr['grid'][0, 0])           # güney satırı: "-1 4"
+    assert np.isnan(lyr['grid'][0, 0])           # south row: "-1 4"
     assert lyr['grid'][1, 1] == 2
 
 
@@ -221,15 +221,15 @@ def _rotated_node_errors(lyr, g, rot_deg, x0=1.0, y0=-24.0):
 
 
 def test_geosoft_rotated_real_file_uses_correct_convention():
-    """Gerçek Oasis dosyası (ROT=-30°): düğüm değerleri döndürülmüş konumlarında bulunmalı."""
+    """Real Oasis file (ROT=-30°): node values must be found at their rotated positions."""
     exp = np.load(os.path.join(GEOSOFT_DIR, 'om_expected.npz'))
-    with pytest.warns(UserWarning, match='Döndürülmüş'):
+    with pytest.warns(UserWarning, match='Rotated'):
         lyr = L.load_grid(os.path.join(GEOSOFT_DIR, 'om_rotate.grd'))
     g = exp['grid']
     right = _rotated_node_errors(lyr, g, -30.0)
     wrong = _rotated_node_errors(lyr, g, +30.0)
     assert len(right) > 200
-    # Kalan hata yalnızca çift interpolasyonun pürüzlülük hatasıdır (σ≈11.2)
+    # The residual error is only the roughness error of the double interpolation (σ≈11.2)
     assert np.median(right) < 0.2 * np.nanstd(g)
     assert np.median(right) < 0.25 * np.median(wrong)
 
@@ -304,9 +304,9 @@ def test_ers_reader_bil_bands_byteorder_and_registration(tmp_path):
                                    "\t\tRegistrationCellX = 0.5\n\t\tRegistrationCellY = 0.5\n")
     (tmp_path / 'r.ers').write_text(hdr)
     lyr = L.load_grid(str(tmp_path / 'r.ers'))
-    # satır 0 = güney → band1'in son satırı
+    # row 0 = south → last row of band1
     np.testing.assert_allclose(lyr['grid'], np.array([[4, np.nan, 6], [1, 2, 3]]), equal_nan=True)
-    # registration hücre merkezi (0.5): ilk hücre merkezi tam (1000, 2030)
+    # registration at the cell centre (0.5): the first cell centre is exactly (1000, 2030)
     np.testing.assert_allclose(lyr['x'], [1000, 1010, 1020])
     np.testing.assert_allclose(lyr['y'], [2010, 2030])
     assert lyr['crs'] == 'SUTM35'
@@ -333,7 +333,7 @@ def test_geotiff_reader_returns_pixel_center_coordinates(tmp_path):
     out = L.read_geotiff(str(tif))
     assert out['x'][0] == pytest.approx(100.5)
     assert out['y'][0] == pytest.approx(198.5)
-    assert out['grid'][0, 0] == 3       # satır 0 = güney
+    assert out['grid'][0, 0] == 3       # row 0 = south
 
 
 @requires_rasterio
@@ -364,10 +364,10 @@ def test_pillow_fallback_without_geotags_uses_pixel_coords(tmp_path):
     with pytest.warns(UserWarning):
         lyr = L._read_tiff_fallback(str(p))
     assert lyr['crs'] == 'pixel'
-    assert lyr['grid'][0, 0] == 3      # alt satır güneydir
+    assert lyr['grid'][0, 0] == 3      # the bottom row is south
 
 
-# ─── Format tespiti ─────────────────────────────────────────────────────────
+# ─── Format detection ───────────────────────────────────────────────────────
 
 def test_detect_format_by_content(tmp_path):
     (tmp_path / 'a.dat').write_text("DSAA\n2 2\n0 1\n0 1\n0 3\n0 1\n2 3\n")
@@ -386,8 +386,8 @@ def test_xyz_lattice_is_reconstructed_exactly(tmp_path):
     X, Y = np.meshgrid(x, y)
     Z = np.sin(X / 300) + Y / 1e5
     keep = np.ones_like(Z, dtype=bool)
-    keep[3:5, 4:7] = False                       # veri boşluğu
-    keep[:, 11] = False                          # tamamen boş son sütun
+    keep[3:5, 4:7] = False                       # data gap
+    keep[:, 11] = False                          # entirely empty last column
     import pandas as pd
     pd.DataFrame({'Easting': X[keep], 'Northing': Y[keep], 'TMI': Z[keep]}).to_csv(
         tmp_path / 'g.xyz', sep='\t', index=False, float_format='%.10g')
@@ -416,7 +416,7 @@ def test_xyz_headerless_whitespace_file(tmp_path, rng):
     pts = rng.uniform(0, 100, (50, 3))
     np.savetxt(tmp_path / 'h.xyz', pts, fmt='%.6f')
     lyr = L.load_grid(str(tmp_path / 'h.xyz'), target_nx=10, target_ny=10)
-    assert lyr['n_points'] == 50                 # ilk satır başlık sanılmamalı
+    assert lyr['n_points'] == 50                 # the first row must not be mistaken for a header
     assert lyr['columns'] == ('x', 'y', 'z')
 
 
@@ -439,13 +439,13 @@ def test_xyz_duplicates_and_max_distance(tmp_path):
     xs, ys = np.meshgrid(np.linspace(0, 10, 6), np.linspace(0, 10, 6))
     df = pd.DataFrame({'x': np.r_[xs.ravel() + 0.01, 0.01],
                        'y': np.r_[ys.ravel() + 0.02, 0.02],
-                       'z': np.r_[np.ones(36), 3.0]})       # (0,0)'da tekrar → ortalama 2
-    df.loc[len(df)] = [100.0, 100.0, 1.0]                  # uzak tek nokta
+                       'z': np.r_[np.ones(36), 3.0]})       # duplicate at (0,0) → mean 2
+    df.loc[len(df)] = [100.0, 100.0, 1.0]                  # single distant point
     df.to_csv(tmp_path / 'd.csv', index=False)
     lyr = L.load_grid(str(tmp_path / 'd.csv'), target_nx=21, target_ny=21,
                       smooth_sigma=0, max_distance=6.0, grid_method='interpolate')
     assert lyr['grid'][0, 0] == pytest.approx(2.0)
-    assert np.isnan(lyr['grid'][10, 10])        # (50, 50) veriye uzak → NaN
+    assert np.isnan(lyr['grid'][10, 10])        # (50, 50) is far from the data → NaN
     assert lyr['n_points'] == 37
 
 
@@ -462,7 +462,7 @@ def test_xyz_collinear_points_fall_back_to_nearest(tmp_path):
 def test_load_grid_kwarg_validation(tmp_path, rng):
     g, x, y = _grid_xy(rng, with_nan=False)
     p = W.save_surfer_ascii_grd(g, x, y, tmp_path / 'g.grd')
-    with pytest.warns(UserWarning, match='yok sayıldı'):
+    with pytest.warns(UserWarning, match='ignored'):
         L.load_grid(p, x_col='a')
     (tmp_path / 'p.csv').write_text("x,y,z\n" + "\n".join(f"{i},{i*2 % 7},{i}" for i in range(20)))
     with pytest.raises(TypeError):
@@ -471,7 +471,7 @@ def test_load_grid_kwarg_validation(tmp_path, rng):
 
 def test_load_grid_all_nan_raises(tmp_path):
     p = W.save_surfer_ascii_grd(np.full((2, 2), np.nan), [0, 1], [0, 1], tmp_path / 'n.grd')
-    with pytest.raises(ValueError, match='tamamen boş'):
+    with pytest.raises(ValueError, match='entirely empty'):
         L.load_grid(p)
 
 
@@ -486,7 +486,7 @@ def test_find_column_exact_beats_partial():
     assert L._find_column(df, None, ['x', 'easting']) == 'x'
     with warnings.catch_warnings():
         warnings.simplefilter('ignore')
-        # sayısal yedek, başka role atanmış (exclude) kolonu seçmemeli
+        # the numeric fallback must not pick a column already assigned to another role (exclude)
         assert L._find_column(df, None, ['easting'], fallback_index=0,
                               exclude=('station_index',)) == 'x'
     with pytest.raises(KeyError):

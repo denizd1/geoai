@@ -1,12 +1,12 @@
 """
 geoai.viz.maps
 ==============
-Jeofizik veri ve model sonuçlarının görselleştirilmesi.
-Tüm grafikler koyu (dark) tema ile bilimsel renk haritaları kullanır.
+Visualization of geophysical data and model results.
+All plots use a dark theme with scientific colormaps.
 
-Not: Bu modül matplotlib backend'ini değiştirmez. Ekransız (headless) Linux
-ortamlarında matplotlib otomatik olarak 'Agg' kullanır; etkileşimsiz bir
-backend'de show=True verilirse figür sadece kapatılır.
+Note: This module does not change the matplotlib backend. In headless Linux
+environments matplotlib automatically falls back to 'Agg'; if show=True is
+passed with a non-interactive backend, the figure is simply closed.
 """
 
 import matplotlib
@@ -20,7 +20,7 @@ from geoai.core.preprocessor import detect_layer_type
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TEMA VE RENKLER
+# THEME AND COLORS
 # ─────────────────────────────────────────────────────────────────────────────
 
 DARK_BG = '#0d1117'
@@ -37,20 +37,20 @@ TARGET_COLORS = [
     '#ffaaaa', '#aaaaff',
 ]
 
-# Prospectivity için özel renk haritası
+# Custom colormap for prospectivity
 _colors_prosp = [
-    (0.05, 0.05, 0.15),   # Koyu lacivert: düşük
-    (0.10, 0.20, 0.50),   # Mavi
+    (0.05, 0.05, 0.15),   # Dark navy: low
+    (0.10, 0.20, 0.50),   # Blue
     (0.00, 0.55, 0.65),   # Teal
-    (0.10, 0.80, 0.30),   # Yeşil
-    (0.90, 0.80, 0.00),   # Sarı
-    (1.00, 0.40, 0.00),   # Turuncu
-    (0.95, 0.10, 0.10),   # Kırmızı: yüksek
+    (0.10, 0.80, 0.30),   # Green
+    (0.90, 0.80, 0.00),   # Yellow
+    (1.00, 0.40, 0.00),   # Orange
+    (0.95, 0.10, 0.10),   # Red: high
 ]
 PROSP_CMAP = LinearSegmentedColormap.from_list(
     'prospectivity', _colors_prosp).with_extremes(bad=NODATA_COLOR)
 
-# Jeofizik katman renk haritaları (katman tipine göre)
+# Geophysical layer colormaps (by layer type)
 LAYER_CMAPS = {
     'magnetic':     'RdBu_r',
     'gravity':      'seismic',
@@ -87,7 +87,7 @@ def _km_label(val, _):
 
 
 def _fmt_ax(ax, coregistrar=None):
-    """Eksen etiketleri: projeksiyonlu (metre) koordinatlarda km, aksi halde ham birim."""
+    """Axis labels: km for projected (metre) coordinates, raw units otherwise."""
     use_km = True
     if coregistrar is not None and coregistrar.ref_x is not None:
         span = max(np.ptp(coregistrar.ref_x), np.ptp(coregistrar.ref_y))
@@ -124,7 +124,7 @@ def _robust_limits(grid):
 def _finalize(fig, save_path, show):
     if save_path:
         fig.savefig(save_path, dpi=150, bbox_inches='tight', facecolor=DARK_BG)
-        print(f"  ✓ Kaydedildi: {save_path}")
+        print(f"  ✓ Saved: {save_path}")
     if show and matplotlib.get_backend().lower() not in _NON_INTERACTIVE:
         plt.show()
     else:
@@ -158,16 +158,16 @@ def _plot_wells(ax, well_df):
 def _wells_legend(ax):
     handles = [
         Line2D([], [], marker='^', color='none', markerfacecolor='lime',
-               markeredgecolor='white', markersize=7, label='Pozitif kuyu'),
+               markeredgecolor='white', markersize=7, label='Positive well'),
         Line2D([], [], marker='v', color='none', markerfacecolor='red',
-               markeredgecolor='white', markersize=7, label='Negatif kuyu'),
+               markeredgecolor='white', markersize=7, label='Negative well'),
     ]
     ax.legend(handles=handles, fontsize=7, facecolor=PANEL_BG, labelcolor=MUTED,
               loc='lower left', framealpha=0.8)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# GİRİŞ KATMANLARI
+# INPUT LAYERS
 # ─────────────────────────────────────────────────────────────────────────────
 
 def plot_input_layers(
@@ -180,10 +180,10 @@ def plot_input_layers(
     masks: dict = None,
 ):
     """
-    Co-register edilmiş giriş katmanlarını çizer.
+    Plots the co-registered input layers.
 
-    registered_layers: {isim: 2D ndarray}
-    masks            : {isim: bool ndarray} — True = gerçek veri yok (gri gösterilir)
+    registered_layers: {name: 2D ndarray}
+    masks            : {name: bool ndarray} — True = no real data (shown in grey)
     """
     names = list(registered_layers.keys())
     n = len(names)
@@ -192,7 +192,7 @@ def plot_input_layers(
 
     fig = plt.figure(figsize=(figsize_per[0] * ncols, figsize_per[1] * nrows + 0.6),
                      facecolor=DARK_BG, layout='constrained')
-    fig.suptitle('JEOFİZİK GİRİŞ KATMANLARI — Co-registered',
+    fig.suptitle('GEOPHYSICAL INPUT LAYERS — Co-registered',
                  color=TEXT_COLOR, fontsize=13, fontweight='bold')
 
     X, Y = np.meshgrid(coregistrar.ref_x, coregistrar.ref_y)
@@ -213,7 +213,7 @@ def plot_input_layers(
         _colorbar(fig, im, ax)
 
         pct_nan = 100 * nodata.mean()
-        suffix = f" [{pct_nan:.0f}% veri yok]" if pct_nan >= 1 else ""
+        suffix = f" [{pct_nan:.0f}% no data]" if pct_nan >= 1 else ""
         ax.set_title(f"{name.replace('_', ' ').upper()} ({detect_layer_type(name)})" + suffix,
                      color=TEXT_COLOR, fontsize=8, fontweight='bold', pad=4)
         _fmt_ax(ax, coregistrar)
@@ -222,7 +222,7 @@ def plot_input_layers(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# OLASILIK HARİTASI
+# PROBABILITY MAP
 # ─────────────────────────────────────────────────────────────────────────────
 
 def plot_prospectivity(
@@ -233,28 +233,28 @@ def plot_prospectivity(
     target_type: str = 'generic',
     well_df=None,
     reference_layer: np.ndarray = None,
-    reference_name: str = 'Referans',
+    reference_name: str = 'Reference',
     save_path: str = None,
     show: bool = True,
     uncertainty_penalty: float = 0.3,
     mode: str = 'supervised',
 ):
     """
-    Ana prospectivity sonuç haritası.
-    4 panel: Referans | Olasılık | Belirsizlik | Güven-düzeltilmiş skor
+    Main prospectivity result map.
+    4 panels: Reference | Probability | Uncertainty | Confidence-adjusted score
     """
     X, Y = np.meshgrid(coregistrar.ref_x, coregistrar.ref_y)
     unsup = mode != 'supervised'
-    p_label = 'Elverişlilik indeksi' if unsup else 'Olasılık'
+    p_label = 'Favorability index' if unsup else 'Probability'
 
     fig = plt.figure(figsize=(21, 5.6), facecolor=DARK_BG, layout='constrained')
     title = f'GeoAI Prospectivity — {target_type.upper()}'
     if unsup:
-        title += '  (denetimsiz mod: kuyu verisi kullanılmadı)'
+        title += '  (unsupervised mode: no well data used)'
     fig.suptitle(title, color=TEXT_COLOR, fontsize=14, fontweight='bold')
     axes = fig.subplots(1, 4)
 
-    # ── Panel 1: Referans katman ──────────────────────────────────────────
+    # ── Panel 1: Reference layer ──────────────────────────────────────────
     ax1 = axes[0]
     _setup_dark_ax(ax1)
     if reference_layer is not None:
@@ -268,7 +268,7 @@ def plot_prospectivity(
         _wells_legend(ax1)
     _fmt_ax(ax1, coregistrar)
 
-    # ── Panel 2: Olasılık Haritası ────────────────────────────────────────
+    # ── Panel 2: Probability Map ──────────────────────────────────────────
     ax2 = axes[1]
     _setup_dark_ax(ax2)
     pm = np.ma.masked_invalid(prob_map)
@@ -285,31 +285,31 @@ def plot_prospectivity(
             pass
     _plot_targets(ax2, targets)
     _plot_wells(ax2, well_df)
-    ax2.set_title('HEDEF ' + ('ELVERİŞLİLİK' if unsup else 'OLASILIK') + ' HARİTASI',
+    ax2.set_title('TARGET ' + ('FAVORABILITY' if unsup else 'PROBABILITY') + ' MAP',
                   color=TEXT_COLOR, fontsize=9, fontweight='bold')
     _fmt_ax(ax2, coregistrar)
 
-    # ── Panel 3: Belirsizlik ──────────────────────────────────────────────
+    # ── Panel 3: Uncertainty ──────────────────────────────────────────────
     ax3 = axes[2]
     _setup_dark_ax(ax3)
     unc_cmap = plt.get_cmap('Greens_r').with_extremes(bad=NODATA_COLOR)
     im3 = ax3.pcolormesh(X, Y, np.ma.masked_invalid(uncertainty_map),
                          cmap=unc_cmap, shading='auto')
-    _colorbar(fig, im3, ax3, 'Belirsizlik (σ)' if not unsup else 'Kanıt uyumsuzluğu')
-    ax3.set_title('BELİRSİZLİK\n(Düşük → Güvenilir)', color=TEXT_COLOR,
+    _colorbar(fig, im3, ax3, 'Uncertainty (σ)' if not unsup else 'Evidence disagreement')
+    ax3.set_title('UNCERTAINTY\n(Low → Reliable)', color=TEXT_COLOR,
                   fontsize=9, fontweight='bold')
     _fmt_ax(ax3, coregistrar)
 
-    # ── Panel 4: Güven-Düzeltilmiş Skor ──────────────────────────────────
+    # ── Panel 4: Confidence-Adjusted Score ───────────────────────────────
     ax4 = axes[3]
     _setup_dark_ax(ax4)
     unc = np.where(np.isfinite(uncertainty_map), uncertainty_map, 0)
     score_map = np.clip(prob_map - uncertainty_penalty * unc, 0, 1)
     im4 = ax4.pcolormesh(X, Y, np.ma.masked_invalid(score_map), cmap=PROSP_CMAP,
                          shading='auto', vmin=0, vmax=1)
-    _colorbar(fig, im4, ax4, 'Güven Skoru')
+    _colorbar(fig, im4, ax4, 'Confidence Score')
     _plot_targets(ax4, targets)
-    ax4.set_title(f'GÜVEN-DÜZELTİLMİŞ SKOR\n(P − {uncertainty_penalty:g}·σ)',
+    ax4.set_title(f'CONFIDENCE-ADJUSTED SCORE\n(P − {uncertainty_penalty:g}·σ)',
                   color=TEXT_COLOR, fontsize=9, fontweight='bold')
     _fmt_ax(ax4, coregistrar)
 
@@ -317,7 +317,7 @@ def plot_prospectivity(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# HEDEF RAPORU
+# TARGET REPORT
 # ─────────────────────────────────────────────────────────────────────────────
 
 def plot_target_report(
@@ -329,25 +329,25 @@ def plot_target_report(
     show: bool = True,
 ):
     """
-    Hedef listesi, CV metrikleri ve feature importance rapor paneli.
+    Report panel with the target list, CV metrics and feature importances.
     """
     n_panels = 2 + (1 if feature_importances is not None else 0) + \
         (1 if cv_results else 0)
     fig = plt.figure(figsize=(5.6 * n_panels, 5.6), facecolor=DARK_BG, layout='constrained')
     axes = np.atleast_1d(fig.subplots(1, n_panels))
 
-    fig.suptitle(f'GeoAI Hedef Raporu — {target_type.upper()}',
+    fig.suptitle(f'GeoAI Target Report — {target_type.upper()}',
                  color=TEXT_COLOR, fontsize=13, fontweight='bold')
     panel = 0
 
-    # ── Panel 0: Hedef Öncelik Barı ───────────────────────────────────────
+    # ── Panel 0: Target Priority Bars ─────────────────────────────────────
     ax = axes[panel]
     _setup_dark_ax(ax)
     panel += 1
-    ax.set_title('HEDEF ÖNCELİK SIRASI', color=TEXT_COLOR, fontweight='bold')
+    ax.set_title('TARGET PRIORITY RANKING', color=TEXT_COLOR, fontweight='bold')
 
     if targets:
-        ranks = [f"T{t['rank']}" + (f" (Ö{t['priority']})" if 'priority' in t else '')
+        ranks = [f"T{t['rank']}" + (f" (Pri {t['priority']})" if 'priority' in t else '')
                  for t in targets]
         probs = [t['max_probability'] for t in targets]
         scores = [t['max_score'] for t in targets]
@@ -358,29 +358,29 @@ def plot_target_report(
                       for i in range(len(ranks))]
 
         ax.barh(y_pos, probs, color=bar_colors, alpha=0.8, height=0.6,
-                label='Maksimum Olasılık', edgecolor='#333')
+                label='Maximum Probability', edgecolor='#333')
         ax.barh(y_pos, scores, color=bar_colors, alpha=0.4, height=0.6,
-                label='Güven Skoru', edgecolor='none')
-        ax.barh(y_pos, uncs, color='gray', alpha=0.6, height=0.2, label='Belirsizlik')
+                label='Confidence Score', edgecolor='none')
+        ax.barh(y_pos, uncs, color='gray', alpha=0.6, height=0.2, label='Uncertainty')
 
         ax.set_yticks(y_pos)
         ax.set_yticklabels(ranks, color=TEXT_COLOR, fontsize=8)
         ax.set_xlim(0, 1.12)
-        ax.set_xlabel('Olasılık / Skor', color=MUTED)
+        ax.set_xlabel('Probability / Score', color=MUTED)
         ax.axvline(0.60, color='yellow', ls='--', lw=1, alpha=0.6)
         ax.axvline(0.75, color='orange', ls='--', lw=1, alpha=0.6)
         ax.legend(fontsize=7, facecolor=PANEL_BG, labelcolor=MUTED, loc='lower right')
         for yp, p in zip(y_pos, probs):
             ax.text(p + 0.01, yp, f'{p:.3f}', va='center', color=TEXT_COLOR, fontsize=7.5)
     else:
-        ax.text(0.5, 0.5, 'Hedef bulunamadı', ha='center', va='center',
+        ax.text(0.5, 0.5, 'No targets found', ha='center', va='center',
                 color=MUTED, transform=ax.transAxes)
 
-    # ── Panel 1: Hedef Konumları Haritası ─────────────────────────────────
+    # ── Panel 1: Target Locations Map ─────────────────────────────────────
     ax = axes[panel]
     _setup_dark_ax(ax)
     panel += 1
-    ax.set_title('HEDEF KONUMLARI\n(Daire boyutu ∝ Alan)', color=TEXT_COLOR, fontweight='bold')
+    ax.set_title('TARGET LOCATIONS\n(Circle size ∝ Area)', color=TEXT_COLOR, fontweight='bold')
 
     if targets:
         xs = np.array([t['x'] for t in targets])
@@ -393,7 +393,7 @@ def plot_target_report(
         sc = ax.scatter(xs / scale, ys / scale, c=[t['max_probability'] for t in targets],
                         s=sizes, cmap=PROSP_CMAP, vmin=0, vmax=1,
                         edgecolors='white', linewidths=0.7, alpha=0.9)
-        _colorbar(fig, sc, ax, 'Olasılık')
+        _colorbar(fig, sc, ax, 'Probability')
         for t in targets:
             ax.annotate(
                 f"T{t['rank']}", (t['x'] / scale, t['y'] / scale),
@@ -406,7 +406,7 @@ def plot_target_report(
         ax.set_xlabel('X' + unit, color=MUTED)
         ax.set_ylabel('Y' + unit, color=MUTED)
 
-    # ── Panel 2: Feature Importance (opsiyonel) ───────────────────────────
+    # ── Panel 2: Feature Importance (optional) ────────────────────────────
     if feature_importances is not None and panel < len(axes):
         ax = axes[panel]
         _setup_dark_ax(ax)
@@ -420,11 +420,11 @@ def plot_target_report(
         labels = [n.replace('__', ' · ').replace('_', ' ')[:34] for n in top.index]
         ax.set_yticks(y_pos)
         ax.set_yticklabels(labels, color=TEXT_COLOR, fontsize=7)
-        ax.set_xlabel('Önem Skoru (ortalama impurity azalması)', color=MUTED)
-        ax.set_title('EN ÖNEMLİ ÖZELLİKLER\n(Random Forest)', color=TEXT_COLOR,
+        ax.set_xlabel('Importance Score (mean decrease in impurity)', color=MUTED)
+        ax.set_title('MOST IMPORTANT FEATURES\n(Random Forest)', color=TEXT_COLOR,
                      fontweight='bold')
 
-    # ── Panel 3: CV Metrikleri (opsiyonel) ────────────────────────────────
+    # ── Panel 3: CV Metrics (optional) ────────────────────────────────────
     if cv_results and panel < len(axes):
         ax = axes[panel]
         _setup_dark_ax(ax)
@@ -448,8 +448,8 @@ def plot_target_report(
         ax.set_ylim(0, 1.1)
         ax.axhline(0.7, color='yellow', ls='--', lw=1, alpha=0.5)
         ax.axhline(0.5, color='red', ls='--', lw=1, alpha=0.3)
-        ax.set_ylabel('Metrik Değeri (out-of-fold)', color=MUTED)
-        ax.set_title('CROSS-VALIDATION METRİKLERİ', color=TEXT_COLOR, fontweight='bold')
+        ax.set_ylabel('Metric Value (out-of-fold)', color=MUTED)
+        ax.set_title('CROSS-VALIDATION METRICS', color=TEXT_COLOR, fontweight='bold')
         ax.legend(fontsize=8, facecolor=PANEL_BG, labelcolor=MUTED, loc='lower right')
 
         for bar in list(bars1) + list(bars2):
@@ -461,7 +461,7 @@ def plot_target_report(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ÇOKLU HEDEF KARŞILAŞTIRMA
+# MULTI-TARGET COMPARISON
 # ─────────────────────────────────────────────────────────────────────────────
 
 def plot_multi_target_comparison(
@@ -471,7 +471,7 @@ def plot_multi_target_comparison(
     show: bool = True,
 ):
     """
-    Birden fazla hedef tipi için olasılık haritalarını yan yana gösterir.
+    Shows probability maps for multiple target types side by side.
     multi_results: {target_type: {'prob_map', 'uncertainty_map', 'targets'}}
     """
     n = len(multi_results)
@@ -480,7 +480,7 @@ def plot_multi_target_comparison(
 
     fig = plt.figure(figsize=(6 * n, 10), facecolor=DARK_BG, layout='constrained')
     axes = np.asarray(fig.subplots(2, n)).reshape(2, n)
-    fig.suptitle('GeoAI — Çok Hedefli Karşılaştırma',
+    fig.suptitle('GeoAI — Multi-Target Comparison',
                  color=TEXT_COLOR, fontsize=14, fontweight='bold')
 
     X, Y = np.meshgrid(coregistrar.ref_x, coregistrar.ref_y)
@@ -488,7 +488,7 @@ def plot_multi_target_comparison(
 
     for col, (typ, res) in enumerate(multi_results.items()):
         unsup = res.get('mode', 'supervised') != 'supervised'
-        tag = ' [denetimsiz]' if unsup else ''
+        tag = ' [unsupervised]' if unsup else ''
 
         ax = axes[0][col]
         _setup_dark_ax(ax)
@@ -496,7 +496,7 @@ def plot_multi_target_comparison(
                            shading='auto', vmin=0, vmax=1)
         _colorbar(fig, im, ax)
         _plot_targets(ax, res['targets'], limit=6)
-        ax.set_title(f'{typ.upper()}{tag}\nOlasılık', color=TEXT_COLOR,
+        ax.set_title(f'{typ.upper()}{tag}\nProbability', color=TEXT_COLOR,
                      fontweight='bold', fontsize=10)
         _fmt_ax(ax, coregistrar)
 
@@ -505,7 +505,7 @@ def plot_multi_target_comparison(
         im2 = ax2.pcolormesh(X, Y, np.ma.masked_invalid(res['uncertainty_map']),
                              cmap=unc_cmap, shading='auto')
         _colorbar(fig, im2, ax2)
-        ax2.set_title(f'{typ.upper()}{tag}\nBelirsizlik', color=TEXT_COLOR,
+        ax2.set_title(f'{typ.upper()}{tag}\nUncertainty', color=TEXT_COLOR,
                       fontweight='bold', fontsize=10)
         _fmt_ax(ax2, coregistrar)
 

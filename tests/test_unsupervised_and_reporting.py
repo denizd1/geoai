@@ -1,4 +1,4 @@
-"""Denetimsiz (bilgi-güdümlü) haritalar ve raporlama testleri."""
+"""Tests for unsupervised (knowledge-driven) maps and reporting."""
 import json
 
 import numpy as np
@@ -11,7 +11,7 @@ from geoai.utils.reporting import combine_targets, save_target_report, write_man
 
 
 def _stack(n=30):
-    """Sol-üst: düşük rezistivite (su), sağ-alt: yüksek IP (sülfür)."""
+    """Upper-left: low resistivity (water); lower-right: high IP (sulphide)."""
     rr, cc = np.mgrid[0:n, 0:n]
     res = np.zeros((n, n))
     res[(rr - 7) ** 2 + (cc - 7) ** 2 < 16] = -4.0
@@ -43,7 +43,7 @@ def test_knowledge_driven_is_target_specific():
     pw, _, info_w = knowledge_driven_maps(stack, names, 'groundwater')
     pm, _, info_m = knowledge_driven_maps(stack, names, 'mineral')
     assert info_w['method'] == info_m['method'] == 'knowledge_driven'
-    # Yeraltı suyu: düşük rezistivite en elverişli; maden: yüksek IP
+    # Groundwater: low resistivity is most favorable; mineral: high IP
     assert pw[7, 7] > pw[22, 22]
     assert pm[22, 22] > pm[7, 7]
     used = {e['layer']: e for e in info_w['evidence']}
@@ -86,7 +86,7 @@ def test_save_target_report_files(tmp_path):
     csv, txt = paths
     assert csv.endswith('P_targets_T.csv') and txt.endswith('P_report_T.txt')
     text = open(txt, encoding='utf-8').read()
-    assert '[GEOTHERMAL]  (denetimsiz' in text and 'Hedef bulunamadı' in text
+    assert '[GEOTHERMAL]  (unsupervised' in text and 'No targets found' in text
     assert 'auc_roc=0.9000' in text
     assert save_target_report({'x': []}, str(tmp_path), timestamp='U') is None
 

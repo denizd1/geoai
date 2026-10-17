@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-GeoAI Kurulum Scripti
-=====================
-Bu scripti çalıştır, gerekli paketleri kurar ve kurulumu doğrular.
+GeoAI Setup Script
+==================
+Run this script to install the required packages and verify the installation.
 
-Kullanım:
+Usage:
     python setup_geoai.py
 """
 
@@ -14,37 +14,37 @@ import importlib
 import os
 
 # ─────────────────────────────────────────────────────────────────────────────
-# GEREKLİ PAKETLER
+# REQUIRED PACKAGES
 # ─────────────────────────────────────────────────────────────────────────────
 
 REQUIRED = [
-    # Paket adı          pip adı               Zorunlu mu?
+    # Import name        pip name              Required?
     ("numpy",            "numpy",               True),
     ("pandas",           "pandas",              True),
     ("scipy",            "scipy",               True),
     ("sklearn",          "scikit-learn",        True),
     ("matplotlib",       "matplotlib",          True),
     ("joblib",           "joblib",              True),
-    ("rasterio",         "rasterio",            False),   # GeoTIFF için
-    ("PIL",              "Pillow",              False),   # rasterio yoksa fallback
+    ("rasterio",         "rasterio",            False),   # for GeoTIFF
+    ("PIL",              "Pillow",              False),   # fallback when rasterio is missing
 ]
 
 # ─────────────────────────────────────────────────────────────────────────────
 
 def check_python_version():
     major, minor = sys.version_info[:2]
-    print(f"Python versiyonu: {major}.{minor}")
+    print(f"Python version: {major}.{minor}")
     if major < 3 or (major == 3 and minor < 9):
-        print("HATA: Python 3.9 veya üstü gereklidir.")
-        print(f"Şu an: Python {major}.{minor}")
-        print("https://www.python.org/downloads/ adresinden güncelleyin.")
+        print("ERROR: Python 3.9 or newer is required.")
+        print(f"Current: Python {major}.{minor}")
+        print("Please upgrade from https://www.python.org/downloads/")
         sys.exit(1)
-    print("  ✓ Python versiyonu uyumlu")
+    print("  ✓ Python version is compatible")
 
 
 def install_package(pip_name: str) -> bool:
-    """Paketi pip ile kurar. Başarılı mı döndürür."""
-    print(f"  Kuruluyor: {pip_name} ...", end=" ", flush=True)
+    """Install a package with pip. Returns whether the installation succeeded."""
+    print(f"  Installing: {pip_name} ...", end=" ", flush=True)
     result = subprocess.run(
         [sys.executable, "-m", "pip", "install", pip_name, "--quiet"],
         capture_output=True,
@@ -54,17 +54,17 @@ def install_package(pip_name: str) -> bool:
         print("✓")
         return True
     else:
-        print("✗ BAŞARISIZ")
+        print("✗ FAILED")
         if result.stderr:
-            # Sadece ilk satırı göster
+            # Show only the first line
             first_err = result.stderr.strip().split('\n')[0]
-            print(f"    Hata: {first_err}")
+            print(f"    Error: {first_err}")
         return False
 
 
 def check_and_install():
     print("\n" + "="*55)
-    print("  GeoAI Paket Kurulumu")
+    print("  GeoAI Package Installation")
     print("="*55)
 
     missing_required   = []
@@ -73,7 +73,7 @@ def check_and_install():
     for import_name, pip_name, required in REQUIRED:
         try:
             importlib.import_module(import_name)
-            print(f"  ✓ {import_name} zaten kurulu")
+            print(f"  ✓ {import_name} already installed")
         except ImportError:
             if required:
                 missing_required.append((import_name, pip_name))
@@ -81,30 +81,30 @@ def check_and_install():
                 missing_optional.append((import_name, pip_name))
 
     if missing_required:
-        print(f"\n  Zorunlu paketler kuruluyor ({len(missing_required)} adet):")
+        print(f"\n  Installing required packages ({len(missing_required)}):")
         for _, pip_name in missing_required:
             ok = install_package(pip_name)
             if not ok:
-                print(f"\n  KRITIK HATA: {pip_name} kurulamadı.")
-                print("  Elle kurmayı deneyin:")
+                print(f"\n  CRITICAL ERROR: {pip_name} could not be installed.")
+                print("  Try installing it manually:")
                 print(f"    pip install {pip_name}")
-                print("  veya conda kullanıyorsanız:")
+                print("  or, if you use conda:")
                 print(f"    conda install {pip_name}")
                 sys.exit(1)
 
     if missing_optional:
-        print(f"\n  Opsiyonel paketler kuruluyor ({len(missing_optional)} adet):")
+        print(f"\n  Installing optional packages ({len(missing_optional)}):")
         for import_name, pip_name in missing_optional:
             ok = install_package(pip_name)
             if not ok:
                 if import_name == "rasterio":
-                    print("    → GeoTIFF desteği olmayacak (Pillow fallback kullanılır)")
-                    print("    → Eğer GeoTIFF gerekirse: conda install rasterio")
+                    print("    → No rasterio GeoTIFF support (the Pillow fallback will be used)")
+                    print("    → If you need full GeoTIFF support: conda install rasterio")
 
 
 def verify_installation():
     print("\n" + "="*55)
-    print("  Kurulum Doğrulama")
+    print("  Installation Verification")
     print("="*55)
 
     all_ok = True
@@ -112,25 +112,25 @@ def verify_installation():
         try:
             mod = importlib.import_module(import_name)
             version = getattr(mod, "__version__", "?")
-            status = "✓" if required else "✓ (ops)"
+            status = "✓" if required else "✓ (opt)"
             print(f"  {status} {import_name:<15} {version}")
         except ImportError:
             if required:
-                print(f"  ✗ {import_name:<15} EKSİK (zorunlu)")
+                print(f"  ✗ {import_name:<15} MISSING (required)")
                 all_ok = False
             else:
-                print(f"  - {import_name:<15} kurulu değil (opsiyonel)")
+                print(f"  - {import_name:<15} not installed (optional)")
 
     return all_ok
 
 
 def verify_geoai():
-    """geoai paketinin erişilebilir olduğunu kontrol eder."""
+    """Check that the geoai package is importable."""
     print("\n" + "="*55)
-    print("  GeoAI Paket Kontrolü")
+    print("  GeoAI Package Check")
     print("="*55)
 
-    # Scriptin bulunduğu klasörü Python path'e ekle
+    # Add the script's directory to the Python path
     script_dir = os.path.dirname(os.path.abspath(__file__))
     if script_dir not in sys.path:
         sys.path.insert(0, script_dir)
@@ -144,21 +144,21 @@ def verify_geoai():
         print("  ✓ geoai.models.prospectivity")
         return True
     except ImportError as e:
-        print(f"  ✗ GeoAI import hatası: {e}")
-        print("  → Bu scriptin geoai/ klasörüyle aynı dizinde olduğundan emin olun.")
-        print("  → Beklenen yapı:")
-        print("      proje/")
-        print("      ├── geoai/          ← paket klasörü")
+        print(f"  ✗ GeoAI import error: {e}")
+        print("  → Make sure this script is in the same directory as the geoai/ folder.")
+        print("  → Expected layout:")
+        print("      project/")
+        print("      ├── geoai/          ← package folder")
         print("      │   ├── pipeline.py")
         print("      │   └── ...")
-        print("      └── setup_geoai.py  ← bu script")
+        print("      └── setup_geoai.py  ← this script")
         return False
 
 
 def run_quick_test():
-    """Basit fonksiyonel test."""
+    """Simple functional smoke test."""
     print("\n" + "="*55)
-    print("  Hızlı Fonksiyonel Test")
+    print("  Quick Functional Test")
     print("="*55)
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -169,22 +169,22 @@ def run_quick_test():
         import numpy as np
         from geoai.models.prospectivity import ImbalanceAnalyzer, geo_smote
 
-        # Dengesizlik analizi testi
+        # Class-imbalance analysis test
         y = np.array([1]*5 + [0]*95)
         imb = ImbalanceAnalyzer(y)
-        assert imb.severity == 'severe', "Şiddet tespiti yanlış"
-        assert abs(imb.ratio - 19.0) < 0.01, "Oran yanlış"
-        print("  ✓ ImbalanceAnalyzer çalışıyor (19:1 → SEVERE)")
+        assert imb.severity == 'severe', "Incorrect severity detection"
+        assert abs(imb.ratio - 19.0) < 0.01, "Incorrect ratio"
+        print("  ✓ ImbalanceAnalyzer works (19:1 → SEVERE)")
 
-        # SMOTE testi
+        # SMOTE test
         np.random.seed(42)
         X = np.random.randn(100, 5).astype(np.float32)
         X[:5] += 3.0
         X_aug, y_aug = geo_smote(X, y, target_ratio=1/3, k_neighbors=4)
-        assert y_aug.sum() > 5, "SMOTE çalışmıyor"
-        print(f"  ✓ SMOTE çalışıyor ({y_aug.sum()} pozitif → {len(y_aug)} toplam)")
+        assert y_aug.sum() > 5, "SMOTE is not working"
+        print(f"  ✓ SMOTE works ({y_aug.sum()} positives → {len(y_aug)} total)")
 
-        # Co-registration testi
+        # Co-registration test
         from geoai.core.preprocessor import CoRegistrar
         import numpy as np
         layers = {
@@ -194,13 +194,13 @@ def run_quick_test():
         cr = CoRegistrar()
         reg = cr.fit_transform(layers, target_nx=40, target_ny=40)
         assert len(reg) == 2
-        print(f"  ✓ Co-registration çalışıyor ({len(reg)} katman hizalandı)")
+        print(f"  ✓ Co-registration works ({len(reg)} layers aligned)")
 
-        print("\n  Tüm testler geçti ✓")
+        print("\n  All tests passed ✓")
         return True
 
     except Exception as e:
-        print(f"  ✗ Test hatası: {e}")
+        print(f"  ✗ Test error: {e}")
         import traceback
         traceback.print_exc()
         return False
@@ -208,45 +208,45 @@ def run_quick_test():
 
 def print_usage():
     print("\n" + "="*55)
-    print("  KULLANIM REHBERİ")
+    print("  USAGE GUIDE")
     print("="*55)
     print("""
-  1. DEMO (sentetik veri ile):
+  1. DEMO (with synthetic data):
   ─────────────────────────────
   python demo.py
 
-  2. GERÇEK VERİ ile:
+  2. With REAL DATA:
   ─────────────────────────────
   python run_project.py
 
-  3. JUPYTER NOTEBOOK ile:
+  3. With a JUPYTER NOTEBOOK:
   ─────────────────────────────
   jupyter notebook geoai_notebook.ipynb
 
-  4. KOMUT SATIRI (JSON konfigürasyon):
+  4. COMMAND LINE (JSON configuration):
   ─────────────────────────────
-  python -m geoai template proje.json   # örnek konfigürasyon
-  python -m geoai run proje.json
+  python -m geoai template project.json   # example configuration
+  python -m geoai run project.json
   python -m geoai info data/magnetic.grd
 
-  Dosya formatları destekleniyor:
+  Supported file formats:
     .grd   → Surfer ASCII / Binary 6 / Binary 7, Geosoft (Oasis Montaj),
-             GMT netCDF (rasterio ile)
-    .tif   → GeoTIFF (rasterio; yoksa Pillow + GeoTIFF etiketleri)
+             GMT netCDF (via rasterio)
+    .tif   → GeoTIFF (rasterio; otherwise Pillow + GeoTIFF tags)
     .ers   → ER Mapper
     .asc   → ESRI ASCII Grid
-    .xyz / .csv / .dat / .txt → düzenli kafes veya dağınık nokta (interpolasyon)
+    .xyz / .csv / .dat / .txt → regular lattice or scattered points (interpolation)
 
-  Örnek kuyu CSV:
+  Example well CSV:
     X,Y,LABEL,TARGET_TYPE
-    312000,4012000,1,mineral    ← pozitif (maden/su bulundu)
-    320000,4018000,0,mineral    ← negatif (boş kuyu)
+    312000,4012000,1,mineral    ← positive (mineralization/water found)
+    320000,4018000,0,mineral    ← negative (dry/barren well)
 """)
 
 
 if __name__ == "__main__":
     print("\n  ╔══════════════════════════════════╗")
-    print("  ║  GeoAI v3.2 — Kurulum Scripti   ║")
+    print("  ║  GeoAI v3.2 — Setup Script       ║")
     print("  ╚══════════════════════════════════╝\n")
 
     check_python_version()
@@ -263,7 +263,7 @@ if __name__ == "__main__":
 
     print("\n" + "="*55)
     if deps_ok and geoai_ok and test_ok:
-        print("  ✓ Kurulum BAŞARILI — GeoAI kullanıma hazır!")
+        print("  ✓ Installation SUCCESSFUL — GeoAI is ready to use!")
     else:
-        print("  ✗ Kurulumda sorun var — yukarıdaki hataları inceleyin.")
+        print("  ✗ Installation has problems — review the errors above.")
     print("="*55 + "\n")

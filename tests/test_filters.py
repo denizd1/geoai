@@ -1,4 +1,4 @@
-"""Fourier tabanlı potansiyel alan filtrelerinin analitik çözümlerle doğrulanması."""
+"""Validation of Fourier-based potential-field filters against analytic solutions."""
 import numpy as np
 import pytest
 
@@ -10,16 +10,16 @@ N = 201
 DX = 100.0           # m
 x = (np.arange(N) - N // 2) * DX
 X, Y = np.meshgrid(x, x)
-C = slice(50, 151)   # kenar etkilerinden uzak merkez bölge
+C = slice(50, 151)   # central region away from edge effects
 
 
 def g_sphere(d):
-    """Nokta kütlenin z = 0 düzlemindeki dikey gravitesi (mGal)."""
+    """Vertical gravity of a point mass on the z = 0 plane (mGal)."""
     return G * MASS * d / (X**2 + Y**2 + d**2) ** 1.5 * 1e5
 
 
 def dgdz_sphere(d):
-    """∂g/∂z (z aşağı pozitif), analitik."""
+    """∂g/∂z (z positive downward), analytic."""
     r2 = X**2 + Y**2
     return G * MASS * (2 * d**2 - r2) / (r2 + d**2) ** 2.5 * 1e5
 
@@ -64,8 +64,8 @@ def test_analytic_signal_and_tilt():
 
     tilt = F.tilt_angle(g, DX, DX)
     assert tilt.min() >= -np.pi / 2 and tilt.max() <= np.pi / 2
-    assert tilt[N // 2, N // 2] == pytest.approx(np.pi / 2, abs=1e-3)   # kaynak üstü
-    # Tilt sıfır konturu: ∂g/∂z = 0 → r = √2·d
+    assert tilt[N // 2, N // 2] == pytest.approx(np.pi / 2, abs=1e-3)   # above the source
+    # Tilt zero contour: ∂g/∂z = 0 → r = √2·d
     r0 = np.sqrt(2) * d
     k = N // 2 + int(round(r0 / DX))
     assert abs(tilt[N // 2, k]) < 0.1

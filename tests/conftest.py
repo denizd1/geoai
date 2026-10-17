@@ -18,12 +18,12 @@ def _has_rasterio():
 
 
 HAS_RASTERIO = _has_rasterio()
-requires_rasterio = pytest.mark.skipif(not HAS_RASTERIO, reason="rasterio yüklü değil")
+requires_rasterio = pytest.mark.skipif(not HAS_RASTERIO, reason="rasterio is not installed")
 
 
 def write_geosoft(path, grid, x0=0.0, y0=0.0, dx=1.0, dy=1.0, dtype='f4', sf=2,
                   kx=1, zbase=0.0, zmult=1.0, rot=0.0):
-    """Test için sıkıştırılmamış Geosoft GRD yazar (grid satır 0 = güney)."""
+    """Write an uncompressed Geosoft GRD for tests (grid row 0 = south)."""
     grid = np.asarray(grid)
     if kx == 1:
         nv, ne = grid.shape
@@ -31,7 +31,7 @@ def write_geosoft(path, grid, x0=0.0, y0=0.0, dx=1.0, dy=1.0, dtype='f4', sf=2,
         de, dv = dx, dy
     else:
         ne, nv = grid.shape
-        data = grid.T          # her vektör bir sütun
+        data = grid.T          # each vector is a column
         de, dv = dy, dx
     es = np.dtype(dtype).itemsize
     header = bytearray(512)

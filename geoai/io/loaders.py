@@ -1,20 +1,20 @@
 """
 geoai.io.loaders
 ================
-Jeofizik dosya formatlarını okuma:
+Readers for geophysical file formats:
   - Surfer GRD: ASCII (DSAA), Binary 6 (DSBB), Binary 7 (DSRB)
-  - Geosoft / Oasis Montaj GRD (sıkıştırılmamış + zlib sıkıştırılmış)
-  - ER Mapper ERS (.ers başlık + ham veri dosyası)
+  - Geosoft / Oasis Montaj GRD (uncompressed + zlib-compressed)
+  - ER Mapper ERS (.ers header + raw data file)
   - ESRI ASCII Grid (.asc)
-  - GeoTIFF / TIFF (rasterio; yoksa Pillow + GeoTIFF etiketleri)
-  - GDAL'ın okuyabildiği diğer rasterlar (rasterio kuruluysa; örn. GMT netCDF .grd)
-  - XYZ / CSV / DAT (düzenli kafes → doğrudan grid; dağınık nokta → interpolasyon)
-  - Kuyu / sondaj CSV
+  - GeoTIFF / TIFF (rasterio; otherwise Pillow + GeoTIFF tags)
+  - Other rasters readable by GDAL (if rasterio is installed; e.g. GMT netCDF .grd)
+  - XYZ / CSV / DAT (regular lattice → direct grid; scattered points → interpolation)
+  - Well / drillhole CSV
 
-Tüm grid okuyucuları aynı sözlük yapısını döndürür:
-    grid : (ny, nx) float64 — satır 0 = en güney satır, NaN = veri yok
-    x, y : artan sıralı piksel-merkezi koordinat vektörleri
-    xmin, xmax, ymin, ymax, nx, ny, format (+ formata özel ek alanlar)
+All grid readers return the same dictionary structure:
+    grid : (ny, nx) float64 — row 0 = southernmost row, NaN = no data
+    x, y : pixel-centre coordinate vectors in ascending order
+    xmin, xmax, ymin, ymax, nx, ny, format (+ format-specific extra fields)
 """
 
 import os
@@ -30,38 +30,38 @@ from scipy.interpolate import griddata
 from scipy.ndimage import gaussian_filter
 
 
-# Surfer'ın boş (blank) değeri. Bu değere eşit veya büyük düğümler boştur.
+# Surfer blank value. Nodes equal to or greater than this value are blank.
 SURFER_BLANK = 1.70141e38
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ORTAK YARDIMCILAR
+# COMMON HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
 
 def make_layer(grid, x, y, fmt: str = 'array', **extra) -> dict:
     """
-    Grid + koordinat vektörlerinden standart katman sözlüğü üretir.
+    Builds a standard layer dictionary from a grid + coordinate vectors.
 
-    - Eksenleri artan sıraya getirir (gerekirse grid'i çevirir).
-    - Boyut uyumunu ve eksenlerin kesin monotonluğunu doğrular.
-    - ±inf değerleri NaN yapar.
+    - Puts the axes in ascending order (flipping the grid if needed).
+    - Validates size consistency and strict monotonicity of the axes.
+    - Converts ±inf values to NaN.
     """
     grid = np.array(grid, dtype=np.float64, copy=True)
     x = np.array(x, dtype=np.float64, copy=True).ravel()
     y = np.array(y, dtype=np.float64, copy=True).ravel()
 
     if grid.ndim != 2:
-        raise ValueError(f"Grid 2 boyutlu olmalı, gelen boyut: {grid.ndim}")
+        raise ValueError(f"Grid must be 2-dimensional, got ndim: {grid.ndim}")
     ny, nx = grid.shape
     if len(x) != nx or len(y) != ny:
         raise ValueError(
-            f"Koordinat/grid boyut uyuşmazlığı: grid {ny}×{nx}, "
+            f"Coordinate/grid size mismatch: grid {ny}×{nx}, "
             f"len(x)={len(x)}, len(y)={len(y)}"
         )
     if nx < 2 or ny < 2:
-        raise ValueError(f"Grid en az 2×2 olmalı, gelen: {ny}×{nx}")
+        raise ValueError(f"Grid must be at least 2×2, got: {ny}×{nx}")
     if not (np.all(np.isfinite(x)) and np.all(np.isfinite(y))):
-        raise ValueError("Koordinat vektörleri sonlu (finite) olmalı.")
+        raise ValueError("Coordinate vectors must be finite.")
 
     if x[0] > x[-1]:
         x = x[::-1]
@@ -70,7 +70,7 @@ def make_layer(grid, x, y, fmt: str = 'array', **extra) -> dict:
         y = y[::-1]
         grid = grid[::-1, :]
     if not (np.all(np.diff(x) > 0) and np.all(np.diff(y) > 0)):
-        raise ValueError("Koordinat vektörleri kesin artan/azalan olmalı.")
+        raise ValueError("Coordinate vectors must be strictly increasing/decreasing.")
 
     grid[~np.isfinite(grid)] = np.nan
 
@@ -88,17 +88,17 @@ def make_layer(grid, x, y, fmt: str = 'array', **extra) -> dict:
 
 def _regularize_rotated(grid, east2d, north2d, fmt, **extra) -> dict:
     """
-    Döndürülmüş (rotated) bir grid'i eksen-paralel düzenli grid'e
-    lineer interpolasyonla yeniden örnekler. Döndürülmüş dikdörtgenin
-    dışında kalan köşe bölgeleri NaN olur.
+    Resamples a rotated grid onto an axis-parallel regular grid by
+    linear interpolation. Corner regions that fall outside the rotated
+    rectangle become NaN.
     """
     valid = np.isfinite(grid)
     if valid.sum() < 3:
-        raise ValueError("Döndürülmüş grid'de yeterli geçerli düğüm yok.")
+        raise ValueError("Not enough valid nodes in the rotated grid.")
     pts_e = east2d[valid]
     pts_n = north2d[valid]
 
-    # Orijinal düğüm aralığı (komşu düğümler arası mesafe)
+    # Original node spacing (distance between neighbouring nodes)
     d_col = np.hypot(east2d[0, 1] - east2d[0, 0], north2d[0, 1] - north2d[0, 0]) \
         if grid.shape[1] > 1 else 1.0
     d_row = np.hypot(east2d[1, 0] - east2d[0, 0], north2d[1, 0] - north2d[0, 0]) \
@@ -112,7 +112,7 @@ def _regularize_rotated(grid, east2d, north2d, fmt, **extra) -> dict:
     max_nodes = 4000
     if nx > max_nodes or ny > max_nodes:
         raise ValueError(
-            f"Döndürülmüş grid düzenli grid'e çevrilemeyecek kadar büyük ({ny}×{nx})."
+            f"Rotated grid is too large to convert to a regular grid ({ny}×{nx})."
         )
     xi = xmin + np.arange(nx) * step
     yi = ymin + np.arange(ny) * step
@@ -120,8 +120,8 @@ def _regularize_rotated(grid, east2d, north2d, fmt, **extra) -> dict:
     out = griddata((pts_e, pts_n), grid[valid], (Xi, Yi), method='linear')
 
     warnings.warn(
-        f"Döndürülmüş grid ({extra.get('rotation', '?')}°) eksen-paralel "
-        f"{ny}×{nx} grid'e lineer interpolasyonla yeniden örneklendi.",
+        f"Rotated grid ({extra.get('rotation', '?')}°) was resampled onto an "
+        f"axis-parallel {ny}×{nx} grid by linear interpolation.",
         UserWarning,
     )
     return make_layer(out, xi, yi, fmt=fmt, **extra)
@@ -133,17 +133,17 @@ def _read_text_tokens(filepath: str) -> list:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# FORMAT TESPİTİ
+# FORMAT DETECTION
 # ─────────────────────────────────────────────────────────────────────────────
 
 GEOSOFT_ELEMENT_SIZES = (1, 2, 4, 8, 1025, 1026, 1028, 1032)
 
 _EXT_MAP = {
-    '.grd': 'auto_grd',      # Surfer / Geosoft / GMT-netCDF olabilir
+    '.grd': 'auto_grd',      # may be Surfer / Geosoft / GMT-netCDF
     '.tif': 'geotiff',
     '.tiff': 'geotiff',
     '.ers': 'ermapper',
-    '.asc': 'auto_text',     # ESRI ASCII Grid veya XYZ
+    '.asc': 'auto_text',     # ESRI ASCII Grid or XYZ
     '.xyz': 'xyz',
     '.csv': 'csv',
     '.txt': 'auto_text',
@@ -157,9 +157,9 @@ _EXT_MAP = {
 
 def detect_format(filepath: str) -> str:
     """
-    Dosya uzantısı ve içerik imzasından (magic bytes) format tespit eder.
+    Detects the format from the file extension and content signature (magic bytes).
 
-    Döndürülen değerler: 'surfer_ascii', 'surfer_binary', 'surfer7_binary',
+    Returned values: 'surfer_ascii', 'surfer_binary', 'surfer7_binary',
     'geosoft_grd', 'ermapper', 'esri_ascii', 'geotiff', 'gdal', 'xyz',
     'csv', 'unknown'.
     """
@@ -176,7 +176,7 @@ def detect_format(filepath: str) -> str:
 
 
 def _detect_grd_type(filepath: str) -> str:
-    """.grd dosyasının alt tipini başlık baytlarından belirler."""
+    """Determines the subtype of a .grd file from its header bytes."""
     with open(filepath, 'rb') as f:
         header = f.read(512)
 
@@ -227,32 +227,32 @@ def _rasterio_available() -> bool:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SURFER GRD OKUYUCULARI
+# SURFER GRD READERS
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _surfer_blank_to_nan(grid: np.ndarray, blank: float = SURFER_BLANK) -> np.ndarray:
-    # float32'ye yuvarlanmış blank değerlerini de yakala
+    # also catch blank values that were rounded to float32
     return np.where(grid >= blank * (1 - 1e-6), np.nan, grid)
 
 
 def read_surfer_ascii_grd(filepath: str) -> dict:
-    """Surfer ASCII GRD (Golden Software DSAA) okur."""
+    """Reads a Surfer ASCII GRD (Golden Software DSAA)."""
     tokens = _read_text_tokens(filepath)
     if not tokens or tokens[0] != 'DSAA':
-        raise ValueError(f"Geçersiz Surfer ASCII GRD başlığı: {filepath}")
+        raise ValueError(f"Invalid Surfer ASCII GRD header: {filepath}")
     try:
         nx, ny = int(tokens[1]), int(tokens[2])
         xmin, xmax = float(tokens[3]), float(tokens[4])
         ymin, ymax = float(tokens[5]), float(tokens[6])
     except (IndexError, ValueError) as e:
-        raise ValueError(f"Surfer ASCII GRD başlığı okunamadı: {e}")
+        raise ValueError(f"Could not read Surfer ASCII GRD header: {e}")
 
     data = np.array(tokens[9:9 + nx * ny], dtype=np.float64)
     if data.size != nx * ny:
         raise ValueError(
-            f"Veri boyutu uyuşmuyor: beklenen {nx*ny}, bulunan {data.size}"
+            f"Data size mismatch: expected {nx*ny}, found {data.size}"
         )
-    # Satırlar Ymin'den Ymax'a (güneyden kuzeye) sıralıdır
+    # Rows are ordered from Ymin to Ymax (south to north)
     grid = _surfer_blank_to_nan(data.reshape((ny, nx)))
     x = np.linspace(xmin, xmax, nx)
     y = np.linspace(ymin, ymax, ny)
@@ -260,18 +260,18 @@ def read_surfer_ascii_grd(filepath: str) -> dict:
 
 
 def read_surfer_binary_grd(filepath: str) -> dict:
-    """Surfer 6 Binary GRD (DSBB) okur."""
+    """Reads a Surfer 6 Binary GRD (DSBB)."""
     with open(filepath, 'rb') as f:
         raw = f.read()
     if raw[:4] != b'DSBB':
-        raise ValueError("Geçersiz Surfer Binary GRD")
+        raise ValueError("Invalid Surfer Binary GRD")
     nx, ny = struct.unpack_from('<hh', raw, 4)
     xmin, xmax, ymin, ymax, _zmin, _zmax = struct.unpack_from('<6d', raw, 8)
     n_values = nx * ny
     expected = 56 + n_values * 4
     if len(raw) < expected:
         raise ValueError(
-            f"Surfer Binary GRD kısa: beklenen ≥{expected} bayt, bulunan {len(raw)}"
+            f"Surfer Binary GRD too short: expected ≥{expected} bytes, found {len(raw)}"
         )
     data = np.frombuffer(raw, dtype='<f4', count=n_values, offset=56)
     grid = _surfer_blank_to_nan(data.reshape((ny, nx)).astype(np.float64))
@@ -282,19 +282,19 @@ def read_surfer_binary_grd(filepath: str) -> dict:
 
 def read_surfer7_binary_grd(filepath: str) -> dict:
     """
-    Surfer 7+ Binary GRD (DSRB) okur.
+    Reads a Surfer 7+ Binary GRD (DSRB).
 
-    Yapı (tüm alanlar little-endian):
+    Layout (all fields little-endian):
       'DSRB' + long size + long version
       'GRID' + long size + nRow, nCol (long) +
              xLL, yLL, xSize, ySize, zMin, zMax, Rotation, BlankValue (double)
-      'DATA' + long size + nRow*nCol double (satırlar güneyden kuzeye)
-      (opsiyonel 'FLTI' fay bölümü — atlanır)
+      'DATA' + long size + nRow*nCol double (rows from south to north)
+      (optional 'FLTI' fault section — skipped)
     """
     with open(filepath, 'rb') as f:
         raw = f.read()
     if raw[:4] != b'DSRB':
-        raise ValueError("Geçersiz Surfer 7 Binary GRD")
+        raise ValueError("Invalid Surfer 7 Binary GRD")
 
     header_size = struct.unpack_from('<i', raw, 4)[0]
     offset = 8 + header_size
@@ -306,7 +306,7 @@ def read_surfer7_binary_grd(filepath: str) -> dict:
         size = struct.unpack_from('<i', raw, offset + 4)[0]
         body = offset + 8
         if size < 0 or body + size > len(raw):
-            raise ValueError(f"Surfer 7 bölüm boyutu geçersiz: {tag!r} {size}")
+            raise ValueError(f"Invalid Surfer 7 section size: {tag!r} {size}")
         if tag == b'GRID':
             n_row, n_col = struct.unpack_from('<ii', raw, body)
             (xll, yll, xsize, ysize, _zmin, _zmax,
@@ -316,21 +316,21 @@ def read_surfer7_binary_grd(filepath: str) -> dict:
                              blank=blank)
         elif tag == b'DATA':
             if grid_info is None:
-                raise ValueError("Surfer 7: DATA bölümü GRID bölümünden önce geldi.")
+                raise ValueError("Surfer 7: DATA section appears before the GRID section.")
             n = grid_info['n_row'] * grid_info['n_col']
             if size < n * 8:
-                raise ValueError("Surfer 7: DATA bölümü beklenenden kısa.")
+                raise ValueError("Surfer 7: DATA section is shorter than expected.")
             data = np.frombuffer(raw, dtype='<f8', count=n, offset=body)
             break
         offset = body + size
 
     if grid_info is None or data is None:
-        raise ValueError("Surfer 7: GRID/DATA bölümleri bulunamadı.")
+        raise ValueError("Surfer 7: GRID/DATA sections not found.")
 
     if grid_info['rotation'] != 0:
         warnings.warn(
-            "Surfer 7 rotasyon alanı sıfır değil; Surfer bu alanı kullanmadığı "
-            "için yok sayıldı.", UserWarning,
+            "Surfer 7 rotation field is non-zero; it was ignored because Surfer "
+            "does not use this field.", UserWarning,
         )
 
     grid = data.reshape((grid_info['n_row'], grid_info['n_col'])).astype(np.float64)
@@ -344,7 +344,7 @@ def read_surfer7_binary_grd(filepath: str) -> dict:
 # GEOSOFT / OASIS MONTAJ GRD
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Veri tipi başına Geosoft dummy (boş) değerleri
+# Geosoft dummy (blank) values per data type
 _GEOSOFT_DUMMIES = {
     'u1': 255, 'i1': -127,
     'u2': 65535, 'i2': -32767,
@@ -362,69 +362,69 @@ def _geosoft_dtype(es: int, sf: int) -> str:
         (8, 0): 'u8', (8, 1): 'i8', (8, 2): 'f8',
     }
     if sf == 3:
-        raise NotImplementedError("Geosoft renk (colour) grid'leri desteklenmiyor.")
+        raise NotImplementedError("Geosoft colour grids are not supported.")
     if (size, sf) not in table:
-        raise ValueError(f"Geçersiz Geosoft veri tipi: ES={es}, SF={sf}")
+        raise ValueError(f"Invalid Geosoft data type: ES={es}, SF={sf}")
     return table[(size, sf)]
 
 
 def _geosoft_decompress(raw: bytes) -> bytes:
     """
-    Sıkıştırılmış Geosoft grid bloklarını açar.
-    Başlıktan (512 bayt) sonra: imza (4), sıkıştırma tipi (4), blok sayısı (4),
-    blok başına vektör (4), blok ofsetleri (int64 × n, dosya başına göre),
-    blok boyutları (int32 × n). Her blok 16 baytlık bir ön başlıkla başlar,
-    ardından zlib akışı gelir.
+    Decompresses compressed Geosoft grid blocks.
+    After the header (512 bytes): signature (4), compression type (4), block count (4),
+    vectors per block (4), block offsets (int64 × n, relative to start of file),
+    block sizes (int32 × n). Each block begins with a 16-byte pre-header,
+    followed by a zlib stream.
     """
     n_blocks = struct.unpack_from('<i', raw, 512 + 8)[0]
     if n_blocks <= 0 or n_blocks > 10_000_000:
-        raise ValueError(f"Geosoft: geçersiz blok sayısı {n_blocks}")
+        raise ValueError(f"Geosoft: invalid block count {n_blocks}")
     offsets = struct.unpack_from(f'<{n_blocks}q', raw, 512 + 16)
     sizes = struct.unpack_from(f'<{n_blocks}i', raw, 512 + 16 + 8 * n_blocks)
     chunks = []
     for off, size in zip(offsets, sizes):
         start, end = off + 16, off + size
         if end > len(raw) or start >= end:
-            raise ValueError("Geosoft: sıkıştırılmış blok dosya dışına taşıyor.")
+            raise ValueError("Geosoft: compressed block extends beyond the end of the file.")
         try:
             chunks.append(zlib.decompress(raw[start:end]))
         except zlib.error as e:
             raise IOError(
-                f"Geosoft sıkıştırılmış blok açılamadı ({e}). Bu sıkıştırma "
-                "türü desteklenmiyor; grid'i Oasis Montaj'da sıkıştırmasız kaydedin."
+                f"Could not decompress Geosoft compressed block ({e}). This compression "
+                "type is not supported; save the grid uncompressed in Oasis Montaj."
             )
     return b''.join(chunks)
 
 
 def read_geosoft_grd(filepath: str) -> dict:
     """
-    Geosoft / Oasis Montaj GRD (format v2) okuyucu.
+    Geosoft / Oasis Montaj GRD (format v2) reader.
 
-    Başlık (512 bayt, little-endian):
-      0  ES  int32  eleman boyutu (1,2,4,8; >1024 → sıkıştırılmış)
-      4  SF  int32  işaret: 0 işaretsiz tamsayı, 1 işaretli, 2 kayan nokta
-      8  NE  int32  vektör başına eleman
-      12 NV  int32  vektör sayısı
-      16 KX  int32  1: vektörler satır, -1: vektörler sütun
+    Header (512 bytes, little-endian):
+      0  ES  int32  element size (1,2,4,8; >1024 → compressed)
+      4  SF  int32  sign: 0 unsigned integer, 1 signed integer, 2 floating point
+      8  NE  int32  elements per vector
+      12 NV  int32  number of vectors
+      16 KX  int32  1: vectors are rows, -1: vectors are columns
       20 DE, 28 DV, 36 X0, 44 Y0, 52 ROT, 60 ZBASE, 68 ZMULT (double)
-    Değer = saklanan / ZMULT + ZBASE. Dummy değerler NaN olur.
+    Value = stored / ZMULT + ZBASE. Dummy values become NaN.
     """
     with open(filepath, 'rb') as f:
         raw = f.read()
     if len(raw) < 512:
-        raise ValueError("Geosoft GRD başlığı eksik (512 bayttan kısa).")
+        raise ValueError("Geosoft GRD header is incomplete (shorter than 512 bytes).")
 
     es, sf, ne, nv, kx = struct.unpack_from('<5i', raw, 0)
     de, dv, x0, y0, rot, zbase, zmult = struct.unpack_from('<7d', raw, 20)
 
     if es not in GEOSOFT_ELEMENT_SIZES:
-        raise ValueError(f"Geosoft: geçersiz eleman boyutu ES={es}")
+        raise ValueError(f"Geosoft: invalid element size ES={es}")
     if kx not in (1, -1):
-        raise NotImplementedError(f"Geosoft: KX={kx} sıralaması desteklenmiyor.")
+        raise NotImplementedError(f"Geosoft: KX={kx} ordering is not supported.")
     if ne <= 0 or nv <= 0:
-        raise ValueError(f"Geosoft: geçersiz boyutlar NE={ne}, NV={nv}")
+        raise ValueError(f"Geosoft: invalid dimensions NE={ne}, NV={nv}")
     if zmult == 0:
-        raise ValueError("Geosoft: ZMULT sıfır olamaz.")
+        raise ValueError("Geosoft: ZMULT cannot be zero.")
 
     dtype = _geosoft_dtype(es, sf)
     n = ne * nv
@@ -432,7 +432,7 @@ def read_geosoft_grd(filepath: str) -> dict:
     itemsize = np.dtype(dtype).itemsize
     if len(payload) < n * itemsize:
         raise ValueError(
-            f"Geosoft: veri bölümü kısa (beklenen {n*itemsize}, bulunan {len(payload)})"
+            f"Geosoft: data section too short (expected {n*itemsize}, found {len(payload)})"
         )
     stored = np.frombuffer(payload, dtype='<' + dtype, count=n).astype(np.float64)
 
@@ -443,10 +443,10 @@ def read_geosoft_grd(filepath: str) -> dict:
     values = stored / zmult + zbase
 
     if kx == 1:
-        grid = values.reshape((nv, ne))           # satır = vektör
+        grid = values.reshape((nv, ne))           # row = vector
         dx, dy = de, dv
     else:
-        grid = values.reshape((ne, nv), order='F')  # sütun = vektör
+        grid = values.reshape((ne, nv), order='F')  # column = vector
         dx, dy = dv, de
     ny, nx = grid.shape
 
@@ -477,7 +477,7 @@ _ERS_CELLTYPES = {
 
 
 def _parse_ers_header(text: str) -> dict:
-    """ERS başlığını iç içe sözlüğe çevirir (anahtarlar küçük harf)."""
+    """Parses an ERS header into a nested dictionary (keys are lower-cased)."""
     root = {}
     stack = [root]
     for line in text.splitlines():
@@ -501,7 +501,7 @@ def _parse_ers_header(text: str) -> dict:
 
 
 def _dms_to_degrees(value: str) -> float:
-    """'DD:MM:SS.s' biçimini ondalık dereceye çevirir."""
+    """Converts a 'DD:MM:SS.s' string to decimal degrees."""
     value = value.strip()
     sign = -1.0 if value.startswith('-') else 1.0
     parts = [abs(float(p)) for p in value.lstrip('+-').split(':')]
@@ -512,35 +512,35 @@ def _dms_to_degrees(value: str) -> float:
 
 def read_ermapper_ers(filepath: str, band: int = 1) -> dict:
     """
-    ER Mapper ERS raster okur (.ers metin başlığı + ham ikili veri).
+    Reads an ER Mapper ERS raster (.ers text header + raw binary data).
 
-    Veri dosyası: 'DataFile' anahtarı, yoksa uzantısız aynı isim.
-    'HeaderOffset' varsa veri .ers dosyasının içindedir.
-    Veri düzeni BIL (satır satır, her satırda bantlar ardışık).
+    Data file: the 'DataFile' key, otherwise the same name without extension.
+    If 'HeaderOffset' is present, the data is stored inside the .ers file.
+    Data layout is BIL (line by line, bands consecutive within each line).
     """
     with open(filepath, 'rb') as f:
         raw_header = f.read()
     text = raw_header.decode('latin-1')
     hdr = _parse_ers_header(text).get('datasetheader')
     if hdr is None:
-        raise ValueError(f"Geçersiz ERS başlığı (DatasetHeader yok): {filepath}")
+        raise ValueError(f"Invalid ERS header (no DatasetHeader): {filepath}")
     ri = hdr.get('rasterinfo', {})
 
     try:
         n_lines = int(ri['nroflines'])
         n_cells = int(ri['nrofcellsperline'])
     except KeyError as e:
-        raise ValueError(f"ERS başlığında eksik alan: {e}")
+        raise ValueError(f"Missing field in ERS header: {e}")
     n_bands = int(ri.get('nrofbands', 1))
     if not 1 <= band <= n_bands:
-        raise ValueError(f"ERS: band={band} geçersiz (bant sayısı {n_bands})")
+        raise ValueError(f"ERS: band={band} is invalid (number of bands: {n_bands})")
     cell_type = ri.get('celltype', 'IEEE4ByteReal').lower()
     if cell_type not in _ERS_CELLTYPES:
-        raise ValueError(f"ERS: desteklenmeyen CellType '{cell_type}'")
+        raise ValueError(f"ERS: unsupported CellType '{cell_type}'")
     endian = '>' if hdr.get('byteorder', 'LSBFirst').lower() == 'msbfirst' else '<'
     dtype = np.dtype(endian + _ERS_CELLTYPES[cell_type])
 
-    # Veri kaynağı
+    # Data source
     if 'headeroffset' in hdr:
         data_bytes = raw_header[int(hdr['headeroffset']):]
     else:
@@ -551,14 +551,14 @@ def read_ermapper_ers(filepath: str, band: int = 1) -> dict:
         data_path = next((p for p in candidates if p.exists() and p != base), None)
         if data_path is None:
             raise FileNotFoundError(
-                f"ERS veri dosyası bulunamadı. Denenen: {[str(c) for c in candidates]}"
+                f"ERS data file not found. Tried: {[str(c) for c in candidates]}"
             )
         with open(data_path, 'rb') as f:
             data_bytes = f.read()
 
     n_needed = n_lines * n_bands * n_cells
     if len(data_bytes) < n_needed * dtype.itemsize:
-        raise ValueError("ERS veri dosyası beklenenden kısa.")
+        raise ValueError("ERS data file is shorter than expected.")
     cube = np.frombuffer(data_bytes, dtype=dtype, count=n_needed)
     cube = cube.reshape((n_lines, n_bands, n_cells))
     grid = cube[:, band - 1, :].astype(np.float64)
@@ -567,12 +567,12 @@ def read_ermapper_ers(filepath: str, band: int = 1) -> dict:
     if null is not None:
         grid[grid == float(null)] = np.nan
 
-    # Koordinatlar
+    # Coordinates
     cs = hdr.get('coordinatespace', {})
     rotation = cs.get('rotation')
     if rotation is not None and abs(_dms_to_degrees(rotation)) > 1e-9:
         raise NotImplementedError(
-            "Döndürülmüş ERS raster'ları desteklenmiyor; rotasyonsuz dışa aktarın."
+            "Rotated ERS rasters are not supported; export without rotation."
         )
     cell = ri.get('cellinfo', {})
     dx = float(cell.get('xdimension', 1.0))
@@ -585,7 +585,7 @@ def read_ermapper_ers(filepath: str, band: int = 1) -> dict:
     elif 'longitude' in reg:
         e0, n0 = _dms_to_degrees(reg['longitude']), _dms_to_degrees(reg['latitude'])
     else:
-        warnings.warn("ERS: RegistrationCoord yok, piksel koordinatları kullanılıyor.",
+        warnings.warn("ERS: no RegistrationCoord, using pixel coordinates.",
                       UserWarning)
         e0, n0 = 0.0, float(n_lines) * dy
     cell_x = float(ri.get('registrationcellx', 0.0))
@@ -594,7 +594,7 @@ def read_ermapper_ers(filepath: str, band: int = 1) -> dict:
     top = n0 + cell_y * dy
 
     x = left + (np.arange(n_cells) + 0.5) * dx
-    y = top - (np.arange(n_lines) + 0.5) * dy     # satır 0 = kuzey → make_layer çevirir
+    y = top - (np.arange(n_lines) + 0.5) * dy     # row 0 = north → make_layer flips it
     proj = cs.get('projection')
     return make_layer(grid, x, y, fmt='ermapper',
                       crs=proj if proj else 'unknown')
@@ -605,7 +605,7 @@ def read_ermapper_ers(filepath: str, band: int = 1) -> dict:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def read_esri_ascii(filepath: str) -> dict:
-    """ESRI ASCII Grid (.asc) okur. İlk veri satırı kuzeydir."""
+    """Reads an ESRI ASCII Grid (.asc). The first data row is the northernmost."""
     tokens = _read_text_tokens(filepath)
     header = {}
     i = 0
@@ -615,33 +615,33 @@ def read_esri_ascii(filepath: str) -> dict:
     try:
         ncols, nrows = int(header['ncols']), int(header['nrows'])
     except KeyError:
-        raise ValueError(f"ESRI ASCII başlığında ncols/nrows yok: {filepath}")
+        raise ValueError(f"ESRI ASCII header has no ncols/nrows: {filepath}")
     if 'cellsize' in header:
         dx = dy = float(header['cellsize'])
     elif 'dx' in header and 'dy' in header:
         dx, dy = float(header['dx']), float(header['dy'])
     else:
-        raise ValueError("ESRI ASCII başlığında cellsize (veya dx/dy) yok.")
+        raise ValueError("ESRI ASCII header has no cellsize (or dx/dy).")
 
     if 'xllcenter' in header:
         x0 = float(header['xllcenter'])
     elif 'xllcorner' in header:
         x0 = float(header['xllcorner']) + dx / 2
     else:
-        raise ValueError("ESRI ASCII başlığında xllcorner/xllcenter yok.")
+        raise ValueError("ESRI ASCII header has no xllcorner/xllcenter.")
     if 'yllcenter' in header:
         y0 = float(header['yllcenter'])
     elif 'yllcorner' in header:
         y0 = float(header['yllcorner']) + dy / 2
     else:
-        raise ValueError("ESRI ASCII başlığında yllcorner/yllcenter yok.")
+        raise ValueError("ESRI ASCII header has no yllcorner/yllcenter.")
 
     data = np.array(tokens[i:i + ncols * nrows], dtype=np.float64)
     if data.size != ncols * nrows:
         raise ValueError(
-            f"ESRI ASCII veri boyutu uyuşmuyor: beklenen {ncols*nrows}, bulunan {data.size}"
+            f"ESRI ASCII data size mismatch: expected {ncols*nrows}, found {data.size}"
         )
-    grid = data.reshape((nrows, ncols))[::-1, :]   # güneyden kuzeye
+    grid = data.reshape((nrows, ncols))[::-1, :]   # south to north
     if 'nodata_value' in header:
         grid = np.where(grid == float(header['nodata_value']), np.nan, grid)
     x = x0 + np.arange(ncols) * dx
@@ -650,16 +650,16 @@ def read_esri_ascii(filepath: str) -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# GEOTIFF / GDAL RASTER OKUYUCULARI
+# GEOTIFF / GDAL RASTER READERS
 # ─────────────────────────────────────────────────────────────────────────────
 
 def read_raster_gdal(filepath: str, band: int = 1, fmt: str = 'gdal') -> dict:
-    """GDAL'ın okuyabildiği herhangi bir raster'ı rasterio ile okur."""
+    """Reads any GDAL-readable raster with rasterio."""
     import rasterio
 
     with rasterio.open(filepath) as src:
         if not 1 <= band <= src.count:
-            raise ValueError(f"band={band} geçersiz (bant sayısı {src.count})")
+            raise ValueError(f"band={band} is invalid (number of bands: {src.count})")
         arr = src.read(band, masked=True)
         grid = np.ma.filled(arr.astype(np.float64), np.nan)
         t = src.transform
@@ -681,7 +681,7 @@ def read_raster_gdal(filepath: str, band: int = 1, fmt: str = 'gdal') -> dict:
 
 
 def read_geotiff(filepath: str) -> dict:
-    """GeoTIFF okur. rasterio varsa kullanır, yoksa Pillow + GeoTIFF etiketleri."""
+    """Reads a GeoTIFF. Uses rasterio if available, otherwise Pillow + GeoTIFF tags."""
     try:
         import rasterio  # noqa: F401
     except ImportError:
@@ -689,7 +689,7 @@ def read_geotiff(filepath: str) -> dict:
     return read_raster_gdal(filepath, fmt='geotiff')
 
 
-# GeoTIFF etiket numaraları
+# GeoTIFF tag numbers
 _TAG_PIXEL_SCALE = 33550
 _TAG_TIEPOINT = 33922
 _TAG_TRANSFORM = 34264
@@ -700,17 +700,17 @@ _GEOKEY_RASTER_TYPE = 1025   # 1 = PixelIsArea, 2 = PixelIsPoint
 
 def _read_tiff_fallback(filepath: str) -> dict:
     """
-    rasterio yokken TIFF okuma (Pillow ile). GeoTIFF etiketleri
-    (ModelPixelScale + ModelTiepoint veya ModelTransformation) varsa
-    coğrafi koordinatlar bunlardan hesaplanır.
+    Reads a TIFF when rasterio is unavailable (via Pillow). If GeoTIFF tags
+    (ModelPixelScale + ModelTiepoint or ModelTransformation) are present,
+    geographic coordinates are computed from them.
     """
     try:
         from PIL import Image
     except ImportError:
         raise ImportError(
-            "GeoTIFF okumak için rasterio veya Pillow gereklidir.\n"
+            "rasterio or Pillow is required to read GeoTIFF files.\n"
             "  pip install rasterio\n"
-            "  veya: pip install Pillow"
+            "  or: pip install Pillow"
         )
 
     with Image.open(filepath) as img:
@@ -756,20 +756,22 @@ def _read_tiff_fallback(filepath: str) -> dict:
             return make_layer(grid, x, y, fmt='tiff_pil', crs='unknown', nodata=nodata)
 
     warnings.warn(
-        "rasterio bulunamadı ve TIFF'te GeoTIFF koordinat etiketi yok; "
-        "piksel koordinatları kullanılıyor. pip install rasterio önerilir.",
+        "rasterio not found and the TIFF has no GeoTIFF coordinate tags; "
+        "using pixel coordinates. pip install rasterio is recommended.",
         UserWarning,
     )
     x = np.arange(nx, dtype=float)
-    y = np.arange(ny, dtype=float)[::-1]     # satır 0 = üst = en büyük y
+    y = np.arange(ny, dtype=float)[::-1]     # row 0 = top = largest y
     return make_layer(grid, x, y, fmt='tiff_pil', crs='pixel', nodata=nodata)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# KOLON TESPİTİ
+# COLUMN DETECTION
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _tokens(name: str) -> list:
+    # The character class deliberately includes Turkish letters so that
+    # Turkish column names are tokenized correctly.
     return [t for t in re.split(r'[^0-9a-zçğıöşü]+', str(name).lower()) if t]
 
 
@@ -782,20 +784,20 @@ def _find_column(
     exclude: tuple = (),
 ) -> str:
     """
-    Kolon adını açık verilmemişse aday listesinden bulur.
+    Finds the column name from the candidate list if it is not given explicitly.
 
-    Arama sırası (her aşama tüm adaylar için denenir):
-      1. Tam eşleşme            ('x' == 'x')
-      2. Parça (token) eşleşmesi ('x' ∈ 'x_utm'.split('_'))
-      3. Alt dize eşleşmesi      (≥3 harfli adaylar: 'res' ⊂ 'resistivity')
-      4. Sayısal kolon yedeği    (fallback_index'inci sayısal kolon)
-    `exclude` içindeki kolonlar (başka role atanmış olanlar) atlanır.
+    Search order (each stage is tried for all candidates):
+      1. Exact match             ('x' == 'x')
+      2. Token match             ('x' ∈ 'x_utm'.split('_'))
+      3. Substring match         (candidates with ≥3 letters: 'res' ⊂ 'resistivity')
+      4. Numeric column fallback (the fallback_index-th numeric column)
+    Columns in `exclude` (already assigned to another role) are skipped.
     """
     if explicit is not None:
         key = str(explicit).strip().lower()
         if key in df.columns:
             return key
-        raise KeyError(f"Kolon bulunamadı: '{explicit}'. Mevcut: {list(df.columns)}")
+        raise KeyError(f"Column not found: '{explicit}'. Available: {list(df.columns)}")
 
     cols = [c for c in df.columns if c not in exclude]
 
@@ -820,14 +822,14 @@ def _find_column(
             idx = min(max(0, int(fallback_index)), len(numeric_all) - 1)
             chosen = numeric_all[idx] if numeric_all[idx] not in exclude else numeric_free[0]
             warnings.warn(
-                f"Kolon tespit edilemedi, sayısal fallback kullanılıyor: "
-                f"'{chosen}' (sayısal kolonlar: {numeric_all[:5]})",
+                f"Could not detect column, using numeric fallback: "
+                f"'{chosen}' (numeric columns: {numeric_all[:5]})",
                 UserWarning
             )
             return chosen
 
     raise KeyError(
-        f"Uygun kolon bulunamadı. Mevcut kolonlar: {list(df.columns)}"
+        f"No suitable column found. Available columns: {list(df.columns)}"
     )
 
 
@@ -854,7 +856,7 @@ def _is_number(token: str) -> bool:
 
 
 def _read_table(filepath: str, delimiter: str = None) -> pd.DataFrame:
-    """CSV/XYZ tablosunu okur; başlıksız (tamamen sayısal) dosyaları da tanır."""
+    """Reads a CSV/XYZ table; also recognises headerless (fully numeric) files."""
     if delimiter is None:
         delimiter = _sniff_delimiter(filepath)
 
@@ -874,7 +876,7 @@ def _read_table(filepath: str, delimiter: str = None) -> pd.DataFrame:
             skip_blank_lines=True, header=None if headerless else 'infer',
         )
     except Exception as e:
-        raise IOError(f"Tablo okunamadı ({filepath}): {e}")
+        raise IOError(f"Could not read table ({filepath}): {e}")
 
     if headerless:
         default_names = ['x', 'y', 'z']
@@ -885,7 +887,7 @@ def _read_table(filepath: str, delimiter: str = None) -> pd.DataFrame:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# XYZ / CSV OKUYUCU (düzenli kafes veya dağınık nokta → grid)
+# XYZ / CSV READER (regular lattice or scattered points → grid)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _unique_sorted(values: np.ndarray, tol: float) -> np.ndarray:
@@ -896,8 +898,8 @@ def _unique_sorted(values: np.ndarray, tol: float) -> np.ndarray:
 
 def _detect_lattice(x: np.ndarray, y: np.ndarray, max_nodes: int = 16_000_000):
     """
-    Noktalar düzenli bir kafes (grid düğümleri) üzerindeyse
-    (x0, dx, nx, y0, dy, ny) döndürür; değilse None.
+    Returns (x0, dx, nx, y0, dy, ny) if the points lie on a regular
+    lattice (grid nodes); otherwise None.
     """
     n = len(x)
     if n < 4:
@@ -925,8 +927,8 @@ def _detect_lattice(x: np.ndarray, y: np.ndarray, max_nodes: int = 16_000_000):
         return None
     x0, dx, nx = ax
     y0, dy, ny = ay
-    # Kafes en az %20 dolu olmalı; aksi halde (örn. tamsayı koordinatlı seyrek
-    # dağınık örnekler) interpolasyon daha uygundur.
+    # The lattice must be at least 20% filled; otherwise (e.g. sparse scattered
+    # samples with integer coordinates) interpolation is more appropriate.
     if nx * ny > max_nodes or nx * ny > 5 * n:
         return None
     fx = (x - x0) / dx
@@ -950,21 +952,22 @@ def read_xyz(
     max_distance: float = None,
 ) -> dict:
     """
-    XYZ/CSV noktalarını okur ve grid'e dönüştürür.
+    Reads XYZ/CSV points and converts them to a grid.
 
-    Parametreler
-    ------------
-    filepath       : Dosya yolu
-    x_col, y_col, z_col : Kolon isimleri (None ise otomatik tespit)
-    delimiter      : Ayırıcı (None ise otomatik)
-    target_nx/ny   : Dağınık veri için çıkış grid boyutu
+    Parameters
+    ----------
+    filepath       : File path
+    x_col, y_col, z_col : Column names (auto-detected if None)
+    delimiter      : Delimiter (auto-detected if None)
+    target_nx/ny   : Output grid size for scattered data
     interp_method  : 'linear', 'nearest', 'cubic'
-    smooth_sigma   : Interpolasyon sonrası Gaussian yumuşatma (piksel; 0 = kapalı)
-    grid_method    : 'auto'  → noktalar düzenli kafes üzerindeyse doğrudan grid,
-                                değilse interpolasyon
-                     'lattice' / 'interpolate' → zorla
-    max_distance   : Dağınık veride, en yakın ölçüm noktasına bu mesafeden
-                     (koordinat birimi) uzak düğümler NaN yapılır (None = kapalı)
+    smooth_sigma   : Gaussian smoothing after interpolation (pixels; 0 = off)
+    grid_method    : 'auto'  → direct gridding if the points lie on a regular
+                                lattice, otherwise interpolation
+                     'lattice' / 'interpolate' → force that method
+    max_distance   : For scattered data, nodes farther than this distance
+                     (in coordinate units) from the nearest measurement point
+                     are set to NaN (None = off)
     """
     df = _read_table(filepath, delimiter)
 
@@ -990,14 +993,14 @@ def read_xyz(
     x, y, z = x[mask], y[mask], z[mask]
 
     if len(x) < 10:
-        raise ValueError(f"Yeterli veri noktası yok: {len(x)} nokta")
+        raise ValueError(f"Not enough data points: {len(x)} points")
 
     if grid_method not in ('auto', 'lattice', 'interpolate'):
-        raise ValueError(f"Geçersiz grid_method: {grid_method}")
+        raise ValueError(f"Invalid grid_method: {grid_method}")
 
     lattice = None if grid_method == 'interpolate' else _detect_lattice(x, y)
     if grid_method == 'lattice' and lattice is None:
-        raise ValueError("Noktalar düzenli bir kafes oluşturmuyor (grid_method='lattice').")
+        raise ValueError("Points do not form a regular lattice (grid_method='lattice').")
 
     if lattice is not None:
         x0, dx, nx, y0, dy, ny = lattice
@@ -1015,7 +1018,7 @@ def read_xyz(
         return make_layer(grid, xi, yi, fmt='xyz_lattice', n_points=int(len(x)),
                           columns=(x_col, y_col, z_col))
 
-    # Aynı koordinattaki tekrar eden noktaların ortalamasını al
+    # Average duplicate points that share the same coordinate
     pts = pd.DataFrame({'x': x, 'y': y, 'z': z}).groupby(['x', 'y'], as_index=False)['z'].mean()
     x, y, z = pts['x'].to_numpy(), pts['y'].to_numpy(), pts['z'].to_numpy()
 
@@ -1025,14 +1028,14 @@ def read_xyz(
 
     try:
         grid = griddata((x, y), z, (Xi, Yi), method=interp_method)
-    except Exception as e:   # örn. tüm noktalar tek doğru üzerinde (QhullError)
+    except Exception as e:   # e.g. all points on a single line (QhullError)
         warnings.warn(
-            f"'{interp_method}' interpolasyonu başarısız ({type(e).__name__}); "
-            "'nearest' kullanılıyor.", UserWarning,
+            f"'{interp_method}' interpolation failed ({type(e).__name__}); "
+            "falling back to 'nearest'.", UserWarning,
         )
         grid = griddata((x, y), z, (Xi, Yi), method='nearest')
 
-    # Konveks örtü dışını nearest ile doldur
+    # Fill nodes outside the convex hull with nearest
     nan_mask = np.isnan(grid)
     if nan_mask.any():
         grid_nearest = griddata((x, y), z, (Xi, Yi), method='nearest')
@@ -1053,7 +1056,7 @@ def read_xyz(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# EVRENSEL YÜKLEYİCİ
+# UNIVERSAL LOADER
 # ─────────────────────────────────────────────────────────────────────────────
 
 _XYZ_KWARGS = {'x_col', 'y_col', 'z_col', 'delimiter', 'target_nx', 'target_ny',
@@ -1062,20 +1065,20 @@ _XYZ_KWARGS = {'x_col', 'y_col', 'z_col', 'delimiter', 'target_nx', 'target_ny',
 
 def load_grid(filepath: str, **kwargs) -> dict:
     """
-    Tek fonksiyonla tüm formatları otomatik okur.
+    Reads any supported format automatically through a single function.
 
-    Parametreler
-    ------------
-    filepath : dosya yolu
-    **kwargs : XYZ/CSV için read_xyz parametreleri; raster formatları için
-               'band' (çok bantlı ERS/GDAL dosyaları).
+    Parameters
+    ----------
+    filepath : file path
+    **kwargs : read_xyz parameters for XYZ/CSV; for raster formats,
+               'band' (multi-band ERS/GDAL files).
 
-    Döndürür
-    --------
-    dict: grid (2D array, satır 0 = güney), x, y vektörleri ve metadata
+    Returns
+    -------
+    dict: grid (2D array, row 0 = south), x, y vectors and metadata
     """
     if not os.path.exists(filepath):
-        raise FileNotFoundError(f"Dosya bulunamadı: {filepath}")
+        raise FileNotFoundError(f"File not found: {filepath}")
 
     fmt = detect_format(filepath)
     band = kwargs.pop('band', 1)
@@ -1083,12 +1086,12 @@ def load_grid(filepath: str, **kwargs) -> dict:
     if fmt in ('xyz', 'csv'):
         unknown = set(kwargs) - _XYZ_KWARGS
         if unknown:
-            raise TypeError(f"read_xyz için bilinmeyen parametre(ler): {sorted(unknown)}")
+            raise TypeError(f"Unknown parameter(s) for read_xyz: {sorted(unknown)}")
         result = read_xyz(filepath, **kwargs)
     else:
         if kwargs:
             warnings.warn(
-                f"'{fmt}' formatı için XYZ parametreleri yok sayıldı: {sorted(kwargs)}",
+                f"XYZ parameters ignored for format '{fmt}': {sorted(kwargs)}",
                 UserWarning,
             )
         loaders = {
@@ -1103,8 +1106,8 @@ def load_grid(filepath: str, **kwargs) -> dict:
         }
         if fmt not in loaders:
             raise ValueError(
-                f"Desteklenmeyen format: '{fmt}' ({filepath})\n"
-                f"Desteklenen: {sorted(list(loaders) + ['xyz', 'csv'])}"
+                f"Unsupported format: '{fmt}' ({filepath})\n"
+                f"Supported: {sorted(list(loaders) + ['xyz', 'csv'])}"
             )
         result = loaders[fmt](filepath)
 
@@ -1115,20 +1118,22 @@ def load_grid(filepath: str, **kwargs) -> dict:
     pct = 100 * n_nan / result['grid'].size
     result['nan_percent'] = float(pct)
     if pct >= 100:
-        raise ValueError(f"{filepath}: grid tamamen boş (NaN).")
+        raise ValueError(f"{filepath}: grid is entirely empty (NaN).")
     if pct > 50:
         warnings.warn(
-            f"{filepath}: %{pct:.1f} boş veri (NaN). "
-            "Grid interpolasyonu veya farklı format deneyin.", UserWarning
+            f"{filepath}: {pct:.1f}% missing data (NaN). "
+            "Try grid interpolation or a different format.", UserWarning
         )
 
     return result
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# KUYU / SONDAJ YÜKLEYİCİ
+# WELL / DRILLHOLE LOADER
 # ─────────────────────────────────────────────────────────────────────────────
 
+# Accepted label strings; 'evet'/'var'/'pozitif' and 'hayir'/'yok'/'negatif'
+# are Turkish aliases for yes/no and must be kept.
 _POSITIVE_STRINGS = {'1', '1.0', 'true', 't', 'yes', 'y', 'pos', 'positive',
                      'evet', 'var', 'pozitif', '+'}
 _NEGATIVE_STRINGS = {'0', '0.0', 'false', 'f', 'no', 'n', 'neg', 'negative',
@@ -1136,7 +1141,7 @@ _NEGATIVE_STRINGS = {'0', '0.0', 'false', 'f', 'no', 'n', 'neg', 'negative',
 
 
 def _parse_labels(series: pd.Series) -> pd.Series:
-    """Etiketleri sayıya çevirir; 'yes/no', 'true/false', 'evet/hayır' tanınır."""
+    """Converts labels to numbers; 'yes/no', 'true/false' and Turkish 'evet/hayir' are recognised."""
     if pd.api.types.is_bool_dtype(series):
         return series.astype(float)
     if pd.api.types.is_numeric_dtype(series):
@@ -1153,7 +1158,7 @@ def _parse_labels(series: pd.Series) -> pd.Series:
         try:
             return float(s)
         except ValueError:
-            return np.nan if s == '' else float('inf')   # geçersiz → hata üretir
+            return np.nan if s == '' else float('inf')   # invalid → triggers an error downstream
     return series.map(_map).astype(float)
 
 
@@ -1167,19 +1172,19 @@ def load_well_data(
     target_type: str = None,
 ) -> pd.DataFrame:
     """
-    Kuyu / sondaj verisi yükler.
+    Loads well / drillhole data.
 
-    Beklenen format (CSV):
-      X, Y, LABEL, TARGET_TYPE (opsiyonel), DEPTH, NOTES, WELL_ID vb.
+    Expected format (CSV):
+      X, Y, LABEL, TARGET_TYPE (optional), DEPTH, NOTES, WELL_ID, etc.
 
-    LABEL: 1 = pozitif (maden/su/jeotermal bulundu), 0 = negatif.
-           'yes/no', 'true/false', 'evet/hayır' de kabul edilir.
-    target_type: verilirse ve dosyada TARGET_TYPE kolonu varsa, sadece bu
-                 tipteki (veya tipi boş olan) kuyular döndürülür.
+    LABEL: 1 = positive (ore/water/geothermal resource found), 0 = negative.
+           'yes/no', 'true/false' and Turkish 'evet/hayir' are also accepted.
+    target_type: if given and the file has a TARGET_TYPE column, only wells
+                 of this type (or with an empty type) are returned.
 
-    Döndürür
-    --------
-    pd.DataFrame: standart kolonlar x, y, label (+ target_type, depth, notes, well_id)
+    Returns
+    -------
+    pd.DataFrame: standard columns x, y, label (+ target_type, depth, notes, well_id)
     """
     df = _read_table(filepath, delimiter)
     n_raw = len(df)
@@ -1193,6 +1198,8 @@ def load_well_data(
         fallback_index=1, allow_numeric_fallback=True, exclude=(x_col,)
     )
     used = [x_col, y_col]
+    # Candidate lists below include Turkish column-name aliases
+    # (e.g. 'hedef_tipi', 'etiket', 'sonuc', 'derinlik', 'aciklama', 'kuyu_id').
     try:
         type_col = _find_column(
             df, target_type_col,
@@ -1242,16 +1249,16 @@ def load_well_data(
         bad_idx = invalid_labels.index[:5]
         preview = ", ".join(df.loc[bad_idx, label_col].astype(str).tolist())
         raise ValueError(
-            "LABEL kolonu sadece 0 veya 1 (ya da yes/no, true/false) içermelidir. "
-            f"Geçersiz örnekler: {preview}"
+            "LABEL column must contain only 0 or 1 (or yes/no, true/false). "
+            f"Invalid examples: {preview}"
         )
     out['label'] = out['label'].astype(int)
 
     n_dropped = n_raw - len(out)
     if n_dropped > 0:
         warnings.warn(
-            f"{filepath}: {n_dropped} satır eksik/geçersiz X, Y veya LABEL "
-            "nedeniyle atlandı.", UserWarning,
+            f"{filepath}: {n_dropped} rows skipped due to missing/invalid X, Y "
+            "or LABEL.", UserWarning,
         )
 
     if target_type is not None and 'target_type' in out.columns:
@@ -1261,13 +1268,13 @@ def load_well_data(
         n_other = int((~keep).sum())
         out = out[keep]
         if n_other:
-            print(f"  ℹ {n_other} kuyu farklı TARGET_TYPE nedeniyle "
-                  f"'{wanted}' için filtrelendi.")
+            print(f"  ℹ {n_other} wells filtered out for '{wanted}' "
+                  f"due to a different TARGET_TYPE.")
 
     out = out.reset_index(drop=True)
     n_pos = int((out['label'] == 1).sum())
     n_neg = int((out['label'] == 0).sum())
-    print(f"  ✓ Kuyu verisi yüklendi: {len(out)} kuyu | "
-          f"Pozitif: {n_pos} | Negatif: {n_neg}")
+    print(f"  ✓ Well data loaded: {len(out)} wells | "
+          f"Positive: {n_pos} | Negative: {n_neg}")
 
     return out

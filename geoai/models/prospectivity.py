@@ -1,46 +1,46 @@
 """
 geoai.models.prospectivity
 ===========================
-Çok hedefli jeofizik prospectivity modeli.
+Multi-target geophysical prospectivity model.
 
-SINIF DENGESİZLİĞİ (Class Imbalance) Stratejisi
--------------------------------------------------
-Jeofizik aramada tipik senaryo: 100 kuyunun 5-10'u pozitif.
-"Tembel sınıflandırıcı" problemi: model hepsini negatif diyerek
-%95 doğruluk elde edebilir, ama hiç hedef bulamaz.
+Class Imbalance Strategy
+------------------------
+Typical scenario in geophysical exploration: only 5-10 out of 100 wells are positive.
+The "lazy classifier" problem: a model can reach 95% accuracy by predicting
+every sample as negative, yet never find a single target.
 
-Çok katmanlı çözüm:
+Multi-layered solution:
 
-  1. ORAN TESPİTİ
-     ImbalanceAnalyzer: neg/pos oranını otomatik hesaplar.
-     < 3:1  → hafif, sınıf ağırlığı yeterli
-     3-10:1 → orta, SMOTE + sınıf ağırlığı
-     10-20:1 → ağır, güçlü SMOTE + eşik ayarı
-     > 20:1 → aşırı
+  1. RATIO DETECTION
+     ImbalanceAnalyzer: computes the neg/pos ratio automatically.
+     < 3:1  → mild, class weighting is sufficient
+     3-10:1 → moderate, SMOTE + class weighting
+     10-20:1 → severe, strong SMOTE + threshold tuning
+     > 20:1 → extreme
 
-  2. TEK KATMANLI SINIF AĞIRLIKLANDIRMA
-     RF/GB: class_weight='balanced'; MLP: dengeli sample_weight
-     (destekleniyorsa). Ağırlıklar bir kez uygulanır (çift ağırlık yok).
+  2. SINGLE-STAGE CLASS WEIGHTING
+     RF/GB: class_weight='balanced'; MLP: balanced sample_weight
+     (if supported). Weights are applied once (no double weighting).
 
-  3. EL YAPIMI SMOTE (imblearn bağımlılığı yok)
-     Pozitif örnekler arası k-NN interpolasyonla sentetik örnekler.
-     Sadece eğitim fold'larına uygulanır, doğrulama fold'una asla.
+  3. BUILT-IN SMOTE (no imblearn dependency)
+     Synthetic samples via k-NN interpolation between positive samples.
+     Applied only to the training folds, never to the validation fold.
 
-  4. MLP İÇİN KALİBRASYON
-     MLP + Platt (sigmoid) kalibrasyonu (CalibratedClassifierCV).
+  4. CALIBRATION FOR THE MLP
+     MLP + Platt (sigmoid) calibration (CalibratedClassifierCV).
 
-  5. THRESHOLD OPTİMİZASYONU
-     0.5 sabit eşiği dengesiz veride çalışmaz.
-     F1 / G-Mean / PR eğrisini maksimize eden eşik OOF olasılıklardan bulunur.
+  5. THRESHOLD OPTIMIZATION
+     A fixed 0.5 threshold does not work on imbalanced data.
+     The threshold maximizing F1 / G-Mean / the PR curve is found from the OOF probabilities.
 
-  6. PR-AUC BAZLI ENSEMBLE
-     w_m = PR-AUC_m / Σ PR-AUC (Σ w = 1). Belirsizlik: ağırlıklı model
-     standart sapması U = sqrt(Σ w_m (p_m − P)²).
+  6. PR-AUC-BASED ENSEMBLE
+     w_m = PR-AUC_m / Σ PR-AUC (Σ w = 1). Uncertainty: weighted standard
+     deviation across models U = sqrt(Σ w_m (p_m − P)²).
 
-  7. UZAYSAL (KUYU-GRUPLU) CROSS-VALIDATION
-     Aynı kuyunun tampon pikselleri aynı fold'a atanır (StratifiedGroupKFold).
-     Böylece komşu piksellerin hem eğitimde hem doğrulamada bulunmasından
-     kaynaklanan iyimser metrik şişmesi (uzaysal sızıntı) engellenir.
+  7. SPATIAL (WELL-GROUPED) CROSS-VALIDATION
+     Buffer pixels of the same well are assigned to the same fold (StratifiedGroupKFold).
+     This prevents the optimistic metric inflation (spatial leakage) caused by
+     neighbouring pixels appearing in both training and validation.
 """
 
 import inspect
@@ -66,12 +66,12 @@ from geoai.core.preprocessor import feature_layer_type
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 1. DENGESİZLİK ANALİZCİSİ
+# 1. IMBALANCE ANALYZER
 # ─────────────────────────────────────────────────────────────────────────────
 
 class ImbalanceAnalyzer:
     """
-    Etiket vektöründen sınıf dengesizliği durumunu analiz eder.
+    Analyzes the class-imbalance state of a label vector.
     """
     MILD     = 'mild'      # < 3:1
     MODERATE = 'moderate'  # 3-10:1
@@ -85,14 +85,14 @@ class ImbalanceAnalyzer:
         self.n_total = len(y)
 
         if self.n_pos == 0:
-            raise ValueError("Pozitif örnek (label=1) yok. En az 3 pozitif örnek gereklidir.")
+            raise ValueError("No positive samples (label=1). At least 3 positive samples are required.")
         if self.n_pos < 3:
             raise ValueError(
-                f"Pozitif örnek çok az: {self.n_pos}. "
-                f"En az 3 pozitif örnek (label=1) gereklidir."
+                f"Too few positive samples: {self.n_pos}. "
+                f"At least 3 positive samples (label=1) are required."
             )
         if self.n_neg == 0:
-            raise ValueError("Negatif örnek (label=0) yok; sınıflandırma için iki sınıf gerekir.")
+            raise ValueError("No negative samples (label=0); classification requires two classes.")
 
         self.ratio = self.n_neg / self.n_pos
 
@@ -103,7 +103,7 @@ class ImbalanceAnalyzer:
 
     @property
     def pos_weight(self) -> float:
-        """Her pozitif örneğe uygulanacak ağırlık çarpanı (n_neg / n_pos)."""
+        """Weight multiplier applied to each positive sample (n_neg / n_pos)."""
         return float(self.ratio)
 
     @property
@@ -113,8 +113,8 @@ class ImbalanceAnalyzer:
     @property
     def smote_target_ratio(self) -> float:
         """
-        SMOTE sonrası hedef pos/neg oranı.
-        Tam 1:1 yapılmaz — bazı dengesizlik sinyal taşır.
+        Target pos/neg ratio after SMOTE.
+        Not balanced to exactly 1:1 — part of the imbalance carries signal.
         """
         if   self.severity == self.EXTREME:  return 1 / 5
         elif self.severity == self.SEVERE:   return 1 / 3
@@ -122,7 +122,7 @@ class ImbalanceAnalyzer:
 
     @property
     def safe_cv_folds(self) -> int:
-        """n_pos'a göre güvenli maksimum CV fold sayısı."""
+        """Safe maximum number of CV folds given n_pos."""
         return max(2, min(5, self.n_pos // 2))
 
     @property
@@ -130,22 +130,22 @@ class ImbalanceAnalyzer:
         return {0: 1.0, 1: self.pos_weight}
 
     def report(self) -> str:
-        smote_str = f"Evet (hedef oran: 1:{1/self.smote_target_ratio:.0f})" \
-                    if self.use_smote else "Hayır"
+        smote_str = f"Yes (target ratio: 1:{1/self.smote_target_ratio:.0f})" \
+                    if self.use_smote else "No"
         return (
             f"  {'─'*48}\n"
-            f"  Sınıf Analizi (piksel örnekleri):\n"
-            f"    Pozitif (1) : {self.n_pos}\n"
-            f"    Negatif (0) : {self.n_neg}\n"
-            f"    Oran        : {self.ratio:.1f}:1\n"
-            f"    Şiddet      : {self.severity.upper()}\n"
-            f"    SMOTE       : {smote_str}\n"
+            f"  Class Analysis (pixel samples):\n"
+            f"    Positive (1) : {self.n_pos}\n"
+            f"    Negative (0) : {self.n_neg}\n"
+            f"    Ratio        : {self.ratio:.1f}:1\n"
+            f"    Severity     : {self.severity.upper()}\n"
+            f"    SMOTE        : {smote_str}\n"
             f"  {'─'*48}"
         )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 2. EL YAPIMI SMOTE
+# 2. BUILT-IN SMOTE
 # ─────────────────────────────────────────────────────────────────────────────
 
 def geo_smote(
@@ -156,14 +156,14 @@ def geo_smote(
     random_state: int = 42,
 ) -> tuple:
     """
-    Sentetik Azınlık Aşırı Örneklemesi — imblearn gerekmez.
+    Synthetic Minority Over-sampling Technique — no imblearn required.
 
-    x_new = x_i + α (x_j − x_i),  α ~ U(0, 1),  x_j ∈ kNN(x_i) (pozitifler içinde)
+    x_new = x_i + α (x_j − x_i),  α ~ U(0, 1),  x_j ∈ kNN(x_i) (among the positives)
 
-    Parametreler
-    ------------
-    target_ratio : SMOTE sonrası hedef n_pos / n_neg oranı
-    k_neighbors  : Komşu sayısı (n_pos-1'den büyük olamaz)
+    Parameters
+    ----------
+    target_ratio : target n_pos / n_neg ratio after SMOTE
+    k_neighbors  : number of neighbours (cannot exceed n_pos-1)
     """
     rng   = np.random.RandomState(random_state)
     X_pos = X[y == 1]
@@ -177,12 +177,12 @@ def geo_smote(
     k = min(k_neighbors, n_pos - 1)
 
     if k < 1:
-        # Tek pozitif örnek var: sadece gürültülü kopyalama
+        # Only one positive sample: noisy duplication only
         idxs = rng.choice(n_pos, size=n_synthetic, replace=True)
         noise_scale = 0.05 * (X.std(axis=0).mean() + 1e-12)
         X_syn = X_pos[idxs] + rng.randn(n_synthetic, X.shape[1]) * noise_scale
     else:
-        # Pozitifler içinde k en yakın komşu (kendisi hariç), ağaç tabanlı arama
+        # k nearest neighbours among the positives (excluding self), tree-based search
         nn_model = NearestNeighbors(n_neighbors=k + 1).fit(X_pos)
         idx = nn_model.kneighbors(X_pos, return_distance=False)
         nn = np.empty((n_pos, k), dtype=np.int64)
@@ -210,15 +210,15 @@ def find_optimal_threshold(
     metric: str = 'f1',
 ) -> float:
     """
-    Dengesiz veri için optimal karar eşiği (0.5 değil), [0.05, 0.95] aralığında.
+    Optimal decision threshold for imbalanced data (instead of 0.5), within [0.05, 0.95].
 
     metric:
-      'f1'    — F1-score maksimizasyonu
-      'gmean' — duyarlılık ve özgüllüğün geometrik ortalaması
-      'pr'    — Precision-Recall eğrisindeki en yüksek F1 noktası
+      'f1'    — maximizes the F1 score
+      'gmean' — geometric mean of sensitivity and specificity
+      'pr'    — highest-F1 point on the precision-recall curve
     """
     if metric not in ('f1', 'gmean', 'pr'):
-        raise ValueError(f"Geçersiz threshold metriği: {metric}")
+        raise ValueError(f"Invalid threshold metric: {metric}")
     y_true = np.asarray(y_true)
     y_prob = np.asarray(y_prob, dtype=float)
 
@@ -251,11 +251,11 @@ def find_optimal_threshold(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 4. KUYU ÖRNEKLEYİCİ
+# 4. WELL SAMPLER
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _disk_offsets(radius_px: float) -> np.ndarray:
-    """Yarıçapı radius_px olan disk içindeki (dr, dc) ofsetleri."""
+    """(dr, dc) offsets inside a disk of radius radius_px."""
     r = max(0.0, float(radius_px))
     ri = int(np.floor(r))
     dr, dc = np.mgrid[-ri:ri + 1, -ri:ri + 1]
@@ -265,24 +265,24 @@ def _disk_offsets(radius_px: float) -> np.ndarray:
 
 class WellSampler:
     """
-    Kuyu lokasyonlarından piksel eğitim örnekleri çıkarır.
+    Extracts pixel training samples from well locations.
 
-    Etiket kuralı (teknik rapor, denklem 16):
-      y(s) = 1  eğer bir pozitif kuyuya mesafe ≤ r+
-      y(s) = 0  eğer (pozitif değilse) bir negatif kuyuya mesafe ≤ r−
-      ek negatifler: pozitif kuyulardan en az d_min uzaktaki rastgele pikseller
-                     (pseudo-absence).
-    Her örnek bir grup kimliği taşır: kuyu pikselleri kendi kuyusunun grubunda,
-    ek negatifler uzaysal bloklarda toplanır (uzaysal CV için).
+    Labelling rule (technical report, equation 16):
+      y(s) = 1  if the distance to a positive well is ≤ r+
+      y(s) = 0  if (not positive and) the distance to a negative well is ≤ r−
+      extra negatives: random pixels at least d_min away from positive wells
+                       (pseudo-absence).
+    Every sample carries a group ID: well pixels belong to their own well's group,
+    extra negatives are pooled into spatial blocks (for spatial CV).
 
-    Parametreler
-    ------------
-    positive_buffer / negative_buffer : tampon yarıçapı (piksel)
-    positive_radius / negative_radius : tampon yarıçapı (koordinat birimi);
-                                        verilirse piksel değerini ezer
-    extra_negatives                   : rastgele ek negatif sayısı
-    extra_negative_min_distance       : ek negatiflerin pozitif kuyulara min.
-                                        uzaklığı (piksel; None → max(4·r+, 8))
+    Parameters
+    ----------
+    positive_buffer / negative_buffer : buffer radius (pixels)
+    positive_radius / negative_radius : buffer radius (coordinate units);
+                                        overrides the pixel value if given
+    extra_negatives                   : number of random extra negatives
+    extra_negative_min_distance       : minimum distance of extra negatives from
+                                        positive wells (pixels; None → max(4·r+, 8))
     """
 
     def __init__(
@@ -318,7 +318,7 @@ class WellSampler:
         valid_mask: np.ndarray = None,
         return_groups: bool = False,
     ) -> tuple:
-        """Döndürür: (X, y) veya return_groups=True ise (X, y, groups)."""
+        """Returns: (X, y), or (X, y, groups) if return_groups=True."""
         ny, nx, nf = feature_stack_norm.shape
         rng = np.random.RandomState(self.random_state)
         if valid_mask is None:
@@ -341,10 +341,10 @@ class WellSampler:
             'n_neg_outside': int(((lbl == 0) & ~inside).sum()),
             'positive_radius_px': r_pos, 'negative_radius_px': r_neg,
         }
-        for cls, name in ((1, 'pozitif'), (0, 'negatif')):
+        for cls, name in ((1, 'positive'), (0, 'negative')):
             n_out = info['n_pos_outside' if cls == 1 else 'n_neg_outside']
             if n_out:
-                warnings.warn(f"{n_out} {name} kuyu grid dışında kaldı ve atlandı.",
+                warnings.warn(f"{n_out} {name} well(s) fell outside the grid and were skipped.",
                               UserWarning)
 
         def _stamp(order_cls, radius_px):
@@ -362,11 +362,11 @@ class WellSampler:
                     used += 1
             return used
 
-        # Pozitifler önce (denklem 16'daki öncelik), sonra negatifler
+        # Positives first (precedence as in equation 16), then negatives
         info['n_pos_wells_used'] = _stamp(1, r_pos)
         info['n_neg_wells_used'] = _stamp(0, r_neg)
 
-        # Ek rastgele negatifler: pozitif kuyulardan uzak, geçerli, etiketsiz pikseller
+        # Extra random negatives: valid, unlabelled pixels far from positive wells
         min_dist = self.extra_negative_min_distance
         if min_dist is None:
             min_dist = max(4 * r_pos, 8)
@@ -382,8 +382,8 @@ class WellSampler:
         n_extra = min(self.extra_negatives, len(cand))
         if n_extra < self.extra_negatives:
             warnings.warn(
-                f"Sadece {n_extra}/{self.extra_negatives} ek negatif örneklenebildi "
-                "(uygun piksel yetersiz).", UserWarning,
+                f"Only {n_extra}/{self.extra_negatives} extra negatives could be sampled "
+                "(not enough eligible pixels).", UserWarning,
             )
         if n_extra > 0:
             chosen = rng.choice(cand, size=n_extra, replace=False)
@@ -406,13 +406,13 @@ class WellSampler:
         self.last_info = info
 
         if len(y) == 0:
-            warnings.warn("Grid içinde kullanılabilir kuyu örneği bulunamadı.", UserWarning)
+            warnings.warn("No usable well samples found within the grid.", UserWarning)
         else:
             print(
-                f"  ✓ Örnekler: {len(y)} piksel | Pozitif: {y.sum()} "
-                f"({info['n_pos_wells_used']} kuyu) | Negatif: {(y == 0).sum()} "
-                f"({info['n_neg_wells_used']} kuyu + {n_extra} ek) | "
-                f"Oran: {(y == 0).sum() / max(1, y.sum()):.1f}:1"
+                f"  ✓ Samples: {len(y)} pixels | Positive: {y.sum()} "
+                f"({info['n_pos_wells_used']} wells) | Negative: {(y == 0).sum()} "
+                f"({info['n_neg_wells_used']} wells + {n_extra} extra) | "
+                f"Ratio: {(y == 0).sum() / max(1, y.sum()):.1f}:1"
             )
         if return_groups:
             return X, y, g
@@ -420,7 +420,7 @@ class WellSampler:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 5. HEDEF TİPİ FEATURE AĞIRLIKLARI
+# 5. TARGET-TYPE FEATURE WEIGHTS
 # ─────────────────────────────────────────────────────────────────────────────
 
 TARGET_FEATURE_WEIGHTS = {
@@ -437,9 +437,9 @@ TARGET_FEATURE_WEIGHTS = {
 
 def apply_feature_weights(X, feature_names, target_type):
     """
-    Hedef tipine göre feature kanallarını ölçekler (katman tipi feature
-    adından tespit edilir). Not: ağaç tabanlı modeller (RF/GB) ölçekten
-    bağımsızdır; ağırlıklar MLP'yi ve SMOTE komşuluk metriğini etkiler.
+    Scales the feature channels according to the target type (the layer type is
+    inferred from the feature name). Note: tree-based models (RF/GB) are
+    scale-invariant; the weights affect the MLP and the SMOTE neighbourhood metric.
     """
     weights = TARGET_FEATURE_WEIGHTS.get(target_type, {})
     if not weights:
@@ -453,7 +453,7 @@ def apply_feature_weights(X, feature_names, target_type):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 6. MODEL YAPILARI
+# 6. MODEL BUILDERS
 # ─────────────────────────────────────────────────────────────────────────────
 
 _MLP_ACCEPTS_SW = 'sample_weight' in inspect.signature(MLPClassifier.fit).parameters
@@ -465,7 +465,7 @@ def _build_ann(n_features: int, imb: ImbalanceAnalyzer) -> CalibratedClassifierC
         hidden_layer_sizes=hidden,
         activation='relu',
         solver='adam',
-        alpha=0.01,           # Güçlü L2 — az pozitif varsa overfit riski
+        alpha=0.01,           # Strong L2 — risk of overfitting when positives are few
         learning_rate='adaptive',
         learning_rate_init=5e-4,
         max_iter=800,
@@ -486,7 +486,7 @@ def _build_rf(imb: ImbalanceAnalyzer) -> RandomForestClassifier:
         min_samples_leaf=max(1, imb.n_pos // 5),
         min_samples_split=max(2, imb.n_pos // 3),
         max_features='sqrt',
-        class_weight='balanced_subsample',  # bootstrap başına yeniden dengele
+        class_weight='balanced_subsample',  # rebalance per bootstrap sample
         oob_score=False,
         random_state=42,
         n_jobs=-1,
@@ -511,11 +511,11 @@ def _build_gb(imb: ImbalanceAnalyzer) -> HistGradientBoostingClassifier:
 
 
 def _fit_model(name: str, clf, X, y):
-    """Sınıf ağırlığını tek bir mekanizmayla uygular (çift ağırlık yok)."""
+    """Applies class weighting through a single mechanism (no double weighting)."""
     if name == 'ann' and _MLP_ACCEPTS_SW:
         clf.fit(X, y, sample_weight=compute_sample_weight('balanced', y))
     else:
-        # RF/GB: class_weight parametresi; eski sklearn'de MLP: ağırlıksız (SMOTE)
+        # RF/GB: class_weight parameter; MLP on older sklearn: unweighted (SMOTE only)
         clf.fit(X, y)
     return clf
 
@@ -532,13 +532,13 @@ def _safe_metrics(y, p) -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 7. ANA MODEL
+# 7. MAIN MODEL
 # ─────────────────────────────────────────────────────────────────────────────
 
 class GeoProspectivityModel:
     """
-    Jeofizik prospectivity modeli (ANN + RF + GB ensemble).
-    Sınıf dengesizliğini otomatik tespit eder ve uygun stratejiyi uygular.
+    Geophysical prospectivity model (ANN + RF + GB ensemble).
+    Automatically detects class imbalance and applies the appropriate strategy.
     """
 
     MODEL_NAMES = ('ann', 'rf', 'gb')
@@ -547,8 +547,8 @@ class GeoProspectivityModel:
         self.name = target_type
         if target_type not in TARGET_FEATURE_WEIGHTS:
             warnings.warn(
-                f"Bilinmeyen hedef tipi '{target_type}': feature ağırlıkları için "
-                "'generic' profili kullanılıyor.", UserWarning,
+                f"Unknown target type '{target_type}': using the 'generic' profile "
+                "for feature weights.", UserWarning,
             )
             target_type = 'generic'
 
@@ -568,7 +568,7 @@ class GeoProspectivityModel:
         self,
         X: np.ndarray,
         y: np.ndarray,
-        sample_weights: np.ndarray = None,  # eski API uyumluluğu için var, kullanılmaz
+        sample_weights: np.ndarray = None,  # kept for backward API compatibility; unused
         feature_names: list = None,
         cv_folds: int = 5,
         threshold_metric: str = 'f1',
@@ -577,37 +577,37 @@ class GeoProspectivityModel:
         cv_strategy: str = 'auto',
     ) -> dict:
         """
-        Modelleri eğitir.
+        Trains the models.
 
-        groups      : her örneğin grup kimliği (örn. kuyu). Verilirse ve
-                      cv_strategy 'auto'/'spatial' ise StratifiedGroupKFold.
+        groups      : group ID of each sample (e.g. the well). If given and
+                      cv_strategy is 'auto'/'spatial', StratifiedGroupKFold is used.
         cv_strategy : 'auto' | 'spatial' | 'random'
-        Döndürür: {model: {'auc_roc', 'auc_pr', 'brier'}, 'ensemble': {...}}
+        Returns: {model: {'auc_roc', 'auc_pr', 'brier'}, 'ensemble': {...}}
         """
         X = np.asarray(X, dtype=np.float32)
         y = np.asarray(y).astype(int)
         if X.ndim != 2 or len(X) != len(y):
-            raise ValueError("X (n, f) ve y (n,) uyumlu olmalı.")
+            raise ValueError("X (n, f) and y (n,) must have compatible shapes.")
         if not np.isfinite(X).all():
-            raise ValueError("X NaN/inf içeremez.")
+            raise ValueError("X must not contain NaN/inf.")
         if cv_strategy not in ('auto', 'spatial', 'random'):
-            raise ValueError(f"Geçersiz cv_strategy: {cv_strategy}")
+            raise ValueError(f"Invalid cv_strategy: {cv_strategy}")
         if cv_strategy == 'spatial' and groups is None:
-            raise ValueError("cv_strategy='spatial' için groups gereklidir.")
+            raise ValueError("groups is required for cv_strategy='spatial'.")
 
         self.feature_names = list(feature_names) if feature_names is not None \
             else [f"f{i}" for i in range(X.shape[1])]
         if len(self.feature_names) != X.shape[1]:
-            raise ValueError("feature_names uzunluğu X sütun sayısıyla uyuşmuyor.")
+            raise ValueError("Length of feature_names does not match the number of columns in X.")
 
-        # ─── Dengesizlik analizi ─────────────────────────────────────────
+        # ─── Imbalance analysis ──────────────────────────────────────────
         self.imbalance = ImbalanceAnalyzer(y)
         if verbose:
-            print(f"\n  Hedef Tipi : {self.name.upper()}")
-            print(f"  Özellikler : {X.shape[1]}")
+            print(f"\n  Target Type : {self.name.upper()}")
+            print(f"  Features    : {X.shape[1]}")
             print(self.imbalance.report())
 
-        # ─── CV stratejisi ve güvenli fold sayısı ───────────────────────
+        # ─── CV strategy and safe fold count ────────────────────────────
         strategy = 'spatial' if (groups is not None and cv_strategy != 'random') else 'random'
         n_pos_groups = n_neg_groups = None
         if strategy == 'spatial':
@@ -617,8 +617,8 @@ class GeoProspectivityModel:
             n_splits = min(cv_folds, n_pos_groups, n_neg_groups)
             if n_splits < 2:
                 warnings.warn(
-                    f"Uzaysal CV için yeterli pozitif kuyu grubu yok ({n_pos_groups}); "
-                    "rastgele piksel CV'sine düşülüyor — metrikler iyimser olabilir.",
+                    f"Not enough positive well groups for spatial CV ({n_pos_groups}); "
+                    "falling back to random pixel CV — metrics may be optimistic.",
                     UserWarning,
                 )
                 strategy = 'random'
@@ -627,8 +627,8 @@ class GeoProspectivityModel:
         n_splits = max(2, int(n_splits))
 
         if verbose and n_splits < cv_folds:
-            print(f"  ⚠ CV: {cv_folds}→{n_splits} fold "
-                  f"({'pozitif kuyu grubu' if strategy == 'spatial' else 'pozitif örnek'} az)")
+            print(f"  ⚠ CV: {cv_folds}→{n_splits} folds "
+                  f"(too few {'positive well groups' if strategy == 'spatial' else 'positive samples'})")
 
         if strategy == 'spatial':
             splitter = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=42)
@@ -644,7 +644,7 @@ class GeoProspectivityModel:
             'threshold_metric': threshold_metric,
         }
 
-        # ─── Feature ağırlıklama ─────────────────────────────────────────
+        # ─── Feature weighting ───────────────────────────────────────────
         X_fw = apply_feature_weights(X, self.feature_names, self.target_type)
 
         configs = {
@@ -655,18 +655,18 @@ class GeoProspectivityModel:
         oof_probs = {name: np.full(len(y), np.nan) for name in configs}
 
         if verbose:
-            label = 'kuyu-gruplu uzaysal' if strategy == 'spatial' else 'rastgele'
-            print(f"\n  Cross-validation ({n_splits} fold, {label}, SMOTE fold içi):")
+            label = 'well-grouped spatial' if strategy == 'spatial' else 'random'
+            print(f"\n  Cross-validation ({n_splits} folds, {label}, SMOTE within folds):")
 
         for fold_i, (tr_idx, va_idx) in enumerate(splits):
             X_tr, y_tr = X_fw[tr_idx], y[tr_idx]
             X_va       = X_fw[va_idx]
             if y_tr.sum() < 2 or (y_tr == 0).sum() < 2:
-                warnings.warn(f"Fold {fold_i}: eğitim kısmında tek sınıf var, atlandı.",
+                warnings.warn(f"Fold {fold_i}: training split contains a single class; skipped.",
                               UserWarning)
                 continue
 
-            # Bu fold'un eğitim kısmına SMOTE (doğrulama kısmına asla)
+            # SMOTE on this fold's training split only (never on the validation split)
             if self.imbalance.use_smote:
                 X_tr_aug, y_tr_aug = geo_smote(
                     X_tr, y_tr,
@@ -682,9 +682,9 @@ class GeoProspectivityModel:
                     _fit_model(name, clf, X_tr_aug, y_tr_aug)
                     oof_probs[name][va_idx] = clf.predict_proba(X_va)[:, 1]
                 except Exception as e:
-                    warnings.warn(f"[{name}] fold {fold_i} hatası: {e}", UserWarning)
+                    warnings.warn(f"[{name}] fold {fold_i} error: {e}", UserWarning)
 
-        # ─── Metrikler (orijinal y üzerinde, sadece OOF tahmini olanlar) ─
+        # ─── Metrics (on the original y, only samples with OOF predictions) ─
         cv_results = {}
         for name in configs:
             have = np.isfinite(oof_probs[name])
@@ -699,7 +699,7 @@ class GeoProspectivityModel:
                     f"Brier: {m['brier']:.4f}"
                 )
 
-        # ─── Ensemble ağırlıkları: PR-AUC bazlı, Σw = 1 ─────────────────
+        # ─── Ensemble weights: PR-AUC-based, Σw = 1 ─────────────────────
         pr_aucs  = {n: max(0.0, cv_results[n]['auc_pr']) for n in configs}
         total_pr = sum(pr_aucs.values())
         if total_pr > 0:
@@ -717,13 +717,13 @@ class GeoProspectivityModel:
         ens_have = np.isfinite(ens_prob)
         if not ens_have.all():
             warnings.warn(
-                f"{(~ens_have).sum()} örnek için OOF tahmini yok; metrik ve eşik "
-                "kalan örneklerden hesaplandı.", UserWarning,
+                f"No OOF prediction for {(~ens_have).sum()} samples; metrics and threshold "
+                "were computed from the remaining samples.", UserWarning,
             )
         cv_results['ensemble'] = _safe_metrics(y[ens_have], ens_prob[ens_have])
         self.oof_ensemble = ens_prob
 
-        # ─── Optimal threshold (OOF ensemble olasılıklarından) ───────────
+        # ─── Optimal threshold (from the OOF ensemble probabilities) ─────
         if ens_have.any() and len(np.unique(y[ens_have])) == 2:
             self.optimal_threshold = find_optimal_threshold(
                 y[ens_have], ens_prob[ens_have], threshold_metric)
@@ -736,20 +736,20 @@ class GeoProspectivityModel:
             print(f"  ENSEMBLE  ROC-AUC: {e['auc_roc']:.4f}  |  PR-AUC: {e['auc_pr']:.4f}"
                   f"  |  Brier: {e['brier']:.4f}")
             print(f"  Optimal Threshold ({threshold_metric}): {self.optimal_threshold:.3f}  "
-                  f"(0.5 yerine)")
+                  f"(instead of 0.5)")
             print(
-                "  Ensemble Ağırlıkları (PR-AUC bazlı, Σ=1): " +
+                "  Ensemble Weights (PR-AUC-based, Σ=1): " +
                 " | ".join(f"{k}={v:.2f}" for k, v in self.weights.items())
             )
             n_above = int((ens_prob[ens_have] >= self.optimal_threshold).sum())
             n_eval = int(ens_have.sum())
-            print(f"  Threshold üzeri örnek: {n_above}/{n_eval} "
-                  f"(%{100*n_above/max(1, n_eval):.1f})")
+            print(f"  Samples above threshold: {n_above}/{n_eval} "
+                  f"({100*n_above/max(1, n_eval):.1f}%)")
             print(f"  {'─'*50}")
 
         self.cv_results = cv_results
 
-        # ─── Final modeller (tüm veri, SMOTE ile) ───────────────────────
+        # ─── Final models (all data, with SMOTE) ────────────────────────
         if self.imbalance.use_smote:
             X_final, y_final = geo_smote(
                 X_fw, y,
@@ -759,25 +759,25 @@ class GeoProspectivityModel:
             )
             if verbose:
                 print(
-                    f"\n  SMOTE (final): +{len(y_final) - len(y)} sentetik pozitif | "
-                    f"Yeni set: {(y_final==0).sum()} neg / {y_final.sum()} pos"
+                    f"\n  SMOTE (final): +{len(y_final) - len(y)} synthetic positives | "
+                    f"New set: {(y_final==0).sum()} neg / {y_final.sum()} pos"
                 )
         else:
             X_final, y_final = X_fw, y
 
         if verbose:
-            print("\n  Final modeller eğitiliyor...")
+            print("\n  Training final models...")
 
         self.models = {}
         for name, clf in configs.items():
             try:
                 self.models[name] = _fit_model(name, clf, X_final, y_final)
             except Exception as e:
-                warnings.warn(f"Final {name} hatası: {e}", UserWarning)
+                warnings.warn(f"Final {name} training error: {e}", UserWarning)
         if not self.models:
-            raise RuntimeError("Hiçbir final model eğitilemedi.")
+            raise RuntimeError("No final model could be trained.")
 
-        # Feature importance (Random Forest, ortalama impurity azalması)
+        # Feature importance (Random Forest, mean decrease in impurity)
         if 'rf' in self.models:
             self.feature_importances = pd.Series(
                 self.models['rf'].feature_importances_,
@@ -796,20 +796,20 @@ class GeoProspectivityModel:
 
     def predict_proba_flat(self, X_flat: np.ndarray) -> tuple:
         """
-        Döndürür: (ensemble P, {model: p_m}, belirsizlik U)
+        Returns: (ensemble P, {model: p_m}, uncertainty U)
         P = Σ w_m p_m ;  U = sqrt(Σ w_m (p_m − P)²)   (Σ w_m = 1)
         """
         if not self.is_trained:
-            raise RuntimeError("Model eğitilmedi.")
+            raise RuntimeError("Model has not been trained.")
         X_w = apply_feature_weights(X_flat, self.feature_names, self.target_type)
         per_model = {}
         for name, clf in self.models.items():
             try:
                 per_model[name] = clf.predict_proba(X_w)[:, 1]
             except Exception as e:
-                warnings.warn(f"{name} tahmin hatası: {e}", UserWarning)
+                warnings.warn(f"{name} prediction error: {e}", UserWarning)
         if not per_model:
-            raise RuntimeError("Hiçbir model tahmin üretemedi.")
+            raise RuntimeError("No model produced any predictions.")
 
         w = self._normalized_weights(list(per_model))
         ensemble = sum(w[n] * p for n, p in per_model.items())
@@ -825,13 +825,13 @@ class GeoProspectivityModel:
         valid_mask: np.ndarray = None,
     ) -> tuple:
         """
-        Tüm grid için tahmin. valid_mask False olan pikseller NaN döner.
-        Döndürür: (prob_map, uncertainty_map, {model: prob_map})
+        Prediction over the full grid. Pixels where valid_mask is False are returned as NaN.
+        Returns: (prob_map, uncertainty_map, {model: prob_map})
         """
         ny, nx, nf = feature_stack_norm.shape
         n_total = ny * nx
         if verbose:
-            print(f"  Grid: {ny}×{nx} = {n_total:,} piksel | Threshold: {self.optimal_threshold:.3f}")
+            print(f"  Grid: {ny}×{nx} = {n_total:,} pixels | Threshold: {self.optimal_threshold:.3f}")
 
         X_all = np.nan_to_num(feature_stack_norm.reshape(-1, nf).astype(np.float32))
         ens_p = np.zeros(n_total, dtype=np.float32)
@@ -846,10 +846,10 @@ class GeoProspectivityModel:
             for n, p in pm.items():
                 pm_p[n][s:e] = p
             if verbose:
-                print(f"    %{100*e/n_total:.0f} tamamlandı...", end='\r')
+                print(f"    {100*e/n_total:.0f}% complete...", end='\r')
 
         if verbose:
-            print("    %100 tamamlandı.              ")
+            print("    100% complete.               ")
 
         prob = ens_p.reshape(ny, nx)
         unc = unc_p.reshape(ny, nx)
@@ -876,19 +876,20 @@ class GeoProspectivityModel:
         connectivity: int = 4,
     ) -> list:
         """
-        Olasılık haritasından hedef bölgeleri çıkarır.
+        Extracts target zones from the probability map.
 
-        Aday maske  B = {P ≥ max(τ, q_percentile(P))}, bağlı bileşenler
-        (4 veya 8 komşuluk). Her bileşen için skor S = clip(P − λU, 0, 1)
-        ağırlıklı merkez (bileşen dışına düşerse en yakın bileşen pikseline
-        çekilir) ve en yüksek skorlu piksel (peak) raporlanır. Bileşenler
-        max_score'a göre sıralanır; birbirine min_distance_pixels'ten yakın
-        olanlar elenir.
+        Candidate mask  B = {P ≥ max(τ, q_percentile(P))}, split into connected
+        components (4- or 8-connectivity). For each component, the centroid
+        weighted by the score S = clip(P − λU, 0, 1) (snapped to the nearest
+        component pixel if it falls outside the component) and the
+        highest-scoring pixel (peak) are reported. Components are sorted by
+        max_score; those closer to each other than min_distance_pixels are
+        discarded.
 
-        Öncelik sınıfı (teknik rapor §14):
-          1: P_maks ≥ 0.75 ve U_ort ≤ 0.20
-          2: P_maks ≥ 0.60 ve U_ort ≤ 0.30   (1 değilse)
-          3: diğer
+        Priority class (technical report §14):
+          1: P_max ≥ 0.75 and U_mean ≤ 0.20
+          2: P_max ≥ 0.60 and U_mean ≤ 0.30   (if not class 1)
+          3: all others
         """
         prob_map = np.asarray(prob_map, dtype=np.float64)
         uncertainty_map = np.asarray(uncertainty_map, dtype=np.float64)
@@ -988,7 +989,7 @@ class GeoProspectivityModel:
             'optimal_threshold': self.optimal_threshold,
             'imbalance_ratio': getattr(self.imbalance, 'ratio', None),
         }, filepath)
-        print(f"  ✓ Model kaydedildi: {filepath}")
+        print(f"  ✓ Model saved: {filepath}")
 
     @classmethod
     def load(cls, filepath: str) -> 'GeoProspectivityModel':
@@ -1005,12 +1006,12 @@ class GeoProspectivityModel:
         m.cv_info = data.get('cv_info', {})
         m.optimal_threshold = data.get('optimal_threshold', 0.5)
         m.is_trained = True
-        print(f"  ✓ Yüklendi: {filepath}")
+        print(f"  ✓ Loaded: {filepath}")
         return m
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 8. ÇOKLU HEDEF YÖNETİCİSİ
+# 8. MULTI-TARGET MANAGER
 # ─────────────────────────────────────────────────────────────────────────────
 
 class MultiTargetProspector:
@@ -1026,7 +1027,7 @@ class MultiTargetProspector:
         well_df, feature_names, coregistrar, valid_mask=None, **kwargs,
     ) -> dict:
         print(f"\n{'═'*58}")
-        print(f"  Hedef: {target_type.upper()}")
+        print(f"  Target: {target_type.upper()}")
         print(f"{'═'*58}")
 
         X, y, groups = self.samplers[target_type].sample(
@@ -1035,8 +1036,8 @@ class MultiTargetProspector:
         )
         if y.sum() < 3 or (y == 0).sum() < 3:
             warnings.warn(
-                f"'{target_type}' için yetersiz eğitim örneği "
-                f"(pozitif={int(y.sum())}, negatif={int((y == 0).sum())}), atlanıyor.",
+                f"Insufficient training samples for '{target_type}' "
+                f"(positive={int(y.sum())}, negative={int((y == 0).sum())}); skipping.",
                 UserWarning,
             )
             return {}
@@ -1053,7 +1054,7 @@ class MultiTargetProspector:
         for typ, model in self.models.items():
             if not self.is_trained.get(typ, False):
                 continue
-            print(f"\n  Tahmin: {typ.upper()}")
+            print(f"\n  Prediction: {typ.upper()}")
             prob, unc, pm = model.predict_grid(feature_stack_norm, valid_mask=valid_mask,
                                                **kwargs)
             targets = model.get_top_targets(prob, unc, coregistrar) if extract_targets else []

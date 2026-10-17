@@ -1,8 +1,8 @@
 """
 geoai.utils.reporting
 ======================
-Hedef listesi ve model metriklerini CSV / metin raporu / JSON manifest
-olarak kaydeder.
+Saves target lists and model metrics as CSV / text report / JSON
+manifest.
 """
 
 import json
@@ -20,14 +20,14 @@ TARGET_COLUMNS = [
 ]
 
 PRIORITY_TEXT = {
-    1: 'Öncelik-1 (P≥0.75, U≤0.20)',
-    2: 'Öncelik-2 (P≥0.60, U≤0.30)',
-    3: 'Öncelik-3 (diğer)',
+    1: 'Priority-1 (P≥0.75, U≤0.20)',
+    2: 'Priority-2 (P≥0.60, U≤0.30)',
+    3: 'Priority-3 (other)',
 }
 
 
 def targets_to_dataframe(targets: list) -> pd.DataFrame:
-    """Hedef listesini (tek hedef tipi) DataFrame'e dönüştürür."""
+    """Converts a target list (single target type) to a DataFrame."""
     if not targets:
         return pd.DataFrame(columns=[c for c in TARGET_COLUMNS if c != 'global_rank'])
     df = pd.DataFrame(targets)
@@ -37,9 +37,9 @@ def targets_to_dataframe(targets: list) -> pd.DataFrame:
 
 def combine_targets(all_targets: dict) -> pd.DataFrame:
     """
-    Tüm hedef tiplerini tek tabloda birleştirir.
-    'rank' her hedef tipi içindeki sıradır (korunur); 'global_rank' tüm
-    tipler arasında güven skoruna (max_score) göre sıradır.
+    Combines all target types into a single table.
+    'rank' is the rank within each target type (preserved); 'global_rank' is
+    the rank across all types by confidence score (max_score).
     """
     frames = []
     for typ, targets in all_targets.items():
@@ -73,21 +73,21 @@ def save_target_report(
     return_all: bool = False,
 ):
     """
-    Tüm hedef tiplerini tek bir CSV'ye ve okunabilir bir metin raporuna kaydeder.
+    Saves all target types to a single CSV and a human-readable text report.
 
-    Parametreler
-    ------------
+    Parameters
+    ----------
     all_targets  : {target_type: list_of_targets}
-    output_dir   : Çıkış klasörü
-    project_name : Rapor başlığı / dosya adı öneki
+    output_dir   : Output directory
+    project_name : Report title / file-name prefix
     cv_results   : {target_type: {model: metrics}}
-    timestamp    : Dosya adı zaman damgası (None → şimdi)
+    timestamp    : File-name timestamp (None → now)
     modes        : {target_type: 'supervised' | 'unsupervised'}
-    return_all   : True → [csv_yolu|None, txt_yolu] listesi döndürür
+    return_all   : True → returns the list [csv_path|None, txt_path]
 
-    Döndürür
-    --------
-    csv yolu (hedef yoksa None) veya return_all=True ise [csv, txt]
+    Returns
+    -------
+    CSV path (None if there are no targets), or [csv, txt] if return_all=True
     """
     Path(output_dir).mkdir(parents=True, exist_ok=True)
     timestamp = timestamp or datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -98,26 +98,26 @@ def save_target_report(
     if len(combined):
         csv_path = Path(output_dir) / f'{project_name}_targets_{timestamp}.csv'
         combined.to_csv(csv_path, index=False, float_format='%.4f', encoding='utf-8')
-        print(f"  ✓ Hedef CSV: {csv_path}")
+        print(f"  ✓ Target CSV: {csv_path}")
 
     txt_path = Path(output_dir) / f'{project_name}_report_{timestamp}.txt'
     with open(txt_path, 'w', encoding='utf-8') as f:
         f.write(f"{'='*72}\n")
-        f.write(f"  {project_name} — JEOFİZİK HEDEF RAPORU\n")
-        f.write(f"  Tarih: {datetime.now().strftime('%Y-%m-%d %H:%M')}\n")
+        f.write(f"  {project_name} — GEOPHYSICAL TARGET REPORT\n")
+        f.write(f"  Date: {datetime.now().strftime('%Y-%m-%d %H:%M')}\n")
         f.write(f"{'='*72}\n")
 
         for typ, targets in all_targets.items():
             mode = modes.get(typ, 'supervised')
             mode_txt = '' if mode == 'supervised' else \
-                '  (denetimsiz: değerler göreli elverişlilik indeksidir)'
+                '  (unsupervised: values are a relative favorability index)'
             f.write(f"\n[{typ.upper()}]{mode_txt}\n{'─'*72}\n")
             if not targets:
-                f.write("  Hedef bulunamadı.\n")
+                f.write("  No targets found.\n")
                 continue
 
-            f.write(f"  {'Sıra':<5}{'X':>13}{'Y':>13}{'P_maks':>9}{'Skor':>9}"
-                    f"{'U_ort':>8}{'Alan_km2':>10}{'Önc.':>6}\n")
+            f.write(f"  {'Rank':<5}{'X':>13}{'Y':>13}{'P_max':>9}{'Score':>9}"
+                    f"{'U_mean':>8}{'Area_km2':>10}{'Pri.':>6}\n")
             f.write(f"  {'─'*71}\n")
             for t in targets:
                 f.write(
@@ -131,10 +131,10 @@ def save_target_report(
                     f"{t.get('priority', '-'):>6}\n"
                 )
 
-        f.write("\n  Öncelik sınıfları: " + " | ".join(PRIORITY_TEXT.values()) + "\n")
+        f.write("\n  Priority classes: " + " | ".join(PRIORITY_TEXT.values()) + "\n")
 
         if cv_results:
-            f.write(f"\n\n{'='*72}\n  MODEL PERFORMANSI (out-of-fold cross-validation)\n{'='*72}\n")
+            f.write(f"\n\n{'='*72}\n  MODEL PERFORMANCE (out-of-fold cross-validation)\n{'='*72}\n")
             for typ, models in cv_results.items():
                 f.write(f"\n[{typ.upper()}]\n")
                 for model, metrics in models.items():
@@ -142,7 +142,7 @@ def save_target_report(
                             " | ".join(f"{k}={_fmt_metric(v)}" for k, v in metrics.items()) +
                             "\n")
 
-    print(f"  ✓ Metin raporu: {txt_path}")
+    print(f"  ✓ Text report: {txt_path}")
     if return_all:
         return [str(csv_path) if csv_path else None, str(txt_path)]
     return str(csv_path) if csv_path else None
@@ -164,7 +164,7 @@ def _json_default(obj):
 
 
 def _sanitize(obj):
-    """JSON'da geçersiz NaN/inf değerlerini None yapar."""
+    """Replaces NaN/inf values (invalid in JSON) with None."""
     if isinstance(obj, dict):
         return {str(k): _sanitize(v) for k, v in obj.items()}
     if isinstance(obj, (list, tuple)):
@@ -175,7 +175,7 @@ def _sanitize(obj):
 
 
 def write_manifest(path: str, manifest: dict) -> str:
-    """Çalıştırma manifest'ini (parametreler, sürümler, metrikler) JSON yazar."""
+    """Writes the run manifest (parameters, versions, metrics) as JSON."""
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     with open(path, 'w', encoding='utf-8') as f:
         json.dump(_sanitize(manifest), f, default=_json_default, ensure_ascii=False, indent=2)

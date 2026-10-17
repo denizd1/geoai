@@ -1,15 +1,15 @@
 """
 geoai.cli
 =========
-Komut satırı arayüzü.
+Command-line interface.
 
     python -m geoai demo  [--nx 120 --ny 120 --types mineral groundwater ...]
-    python -m geoai run   proje.json [--output-dir out/ --show-plots]
-    python -m geoai info  dosya1.grd dosya2.tif ...
-    python -m geoai template proje.json
+    python -m geoai run   project.json [--output-dir out/ --show-plots]
+    python -m geoai info  file1.grd file2.tif ...
+    python -m geoai template project.json
 
-Konfigürasyon (JSON) örneği için: python -m geoai template ornek.json
-Göreli dosya yolları konfigürasyon dosyasının bulunduğu klasöre göre çözülür.
+For an example (JSON) configuration: python -m geoai template example.json
+Relative file paths are resolved against the directory containing the configuration file.
 """
 
 import argparse
@@ -33,7 +33,7 @@ WELL_KEYS = {'path', 'target_type', 'x_col', 'y_col', 'label_col',
              'target_type_col', 'delimiter'}
 
 TEMPLATE = {
-    "project_name": "Saha_A_2026",
+    "project_name": "Site_A_2026",
     "output_dir": "output",
     "layers": [
         {"path": "data/magnetic.grd", "name": "magnetic_tmi"},
@@ -63,40 +63,40 @@ TEMPLATE = {
 
 
 class ConfigError(ValueError):
-    """Geçersiz proje konfigürasyonu."""
+    """Invalid project configuration."""
 
 
 def _check_keys(obj: dict, allowed: set, where: str):
     if not isinstance(obj, dict):
-        raise ConfigError(f"{where} bir JSON nesnesi olmalı.")
+        raise ConfigError(f"{where} must be a JSON object.")
     unknown = set(obj) - allowed
     if unknown:
-        raise ConfigError(f"{where}: bilinmeyen anahtar(lar) {sorted(unknown)}. "
-                          f"İzin verilenler: {sorted(allowed)}")
+        raise ConfigError(f"{where}: unknown key(s) {sorted(unknown)}. "
+                          f"Allowed: {sorted(allowed)}")
 
 
 def load_config(path: str) -> dict:
-    """Konfigürasyonu okur, doğrular ve göreli yolları mutlak yapar."""
+    """Reads and validates the configuration and makes relative paths absolute."""
     cfg_path = Path(path)
     try:
         cfg = json.loads(cfg_path.read_text(encoding='utf-8'))
     except json.JSONDecodeError as e:
-        raise ConfigError(f"JSON okunamadı ({path}): {e}")
-    _check_keys(cfg, {'project_name', 'output_dir', 'layers', 'wells', 'run'}, 'Kök')
+        raise ConfigError(f"Could not parse JSON ({path}): {e}")
+    _check_keys(cfg, {'project_name', 'output_dir', 'layers', 'wells', 'run'}, 'Root')
     base = cfg_path.resolve().parent
 
     layers = cfg.get('layers') or []
     if not layers:
-        raise ConfigError("'layers' listesi boş olamaz.")
+        raise ConfigError("The 'layers' list must not be empty.")
     for i, lyr in enumerate(layers):
         _check_keys(lyr, LAYER_KEYS, f"layers[{i}]")
         if 'path' not in lyr:
-            raise ConfigError(f"layers[{i}]: 'path' zorunlu.")
+            raise ConfigError(f"layers[{i}]: 'path' is required.")
         lyr['path'] = str((base / lyr['path']).resolve())
     for i, w in enumerate(cfg.get('wells') or []):
         _check_keys(w, WELL_KEYS, f"wells[{i}]")
         if 'path' not in w:
-            raise ConfigError(f"wells[{i}]: 'path' zorunlu.")
+            raise ConfigError(f"wells[{i}]: 'path' is required.")
         w['path'] = str((base / w['path']).resolve())
     run = cfg.get('run') or {}
     _check_keys(run, RUN_KEYS, "run")
@@ -113,22 +113,22 @@ def run_from_config(cfg: dict, output_dir: str = None, show_plots: bool = None):
     from geoai.pipeline import GeoAIPipeline
 
     pipe = GeoAIPipeline(project_name=cfg.get('project_name', 'GeoAI'))
-    print("\nJeofizik katmanlar yükleniyor...")
+    print("\nLoading geophysical layers...")
     for lyr in cfg['layers']:
         kwargs = {k: v for k, v in lyr.items() if k not in ('path', 'name')}
         pipe.add_layer(lyr['path'], name=lyr.get('name'), **kwargs)
     if cfg['wells']:
-        print("\nKuyu verileri yükleniyor...")
+        print("\nLoading well data...")
     for w in cfg['wells']:
         kwargs = {k: v for k, v in w.items() if k != 'path'}
         pipe.add_wells(w['path'], **kwargs)
 
     if pipe.load_errors:
-        print("\nUYARI: Bazı kaynaklar yüklenemedi:")
+        print("\nWARNING: Some sources could not be loaded:")
         for src, err in pipe.load_errors:
             print(f"  - {err}")
     if not pipe.layers:
-        raise RuntimeError("Hiçbir katman yüklenemedi; çalıştırma durduruldu.")
+        raise RuntimeError("No layers could be loaded; run aborted.")
 
     run = dict(cfg['run'])
     run.setdefault('show_plots', False)
@@ -140,14 +140,14 @@ def run_from_config(cfg: dict, output_dir: str = None, show_plots: bool = None):
 
 def print_targets(results: dict, limit: int = 10):
     print("\n" + "═" * 70)
-    print("  HEDEF LİSTESİ")
+    print("  TARGET LIST")
     print("═" * 70)
     for typ, res in results.items():
         targets = res.get('targets', [])
-        tag = '' if res.get('mode') == 'supervised' else ' (denetimsiz)'
-        print(f"\n  [{typ.upper()}]{tag} — {len(targets)} hedef")
-        print(f"  {'Sıra':<5}{'X':>13}{'Y':>13}{'P_maks':>9}{'Skor':>9}"
-              f"{'Alan km²':>10}{'Önc.':>6}")
+        tag = '' if res.get('mode') == 'supervised' else ' (unsupervised)'
+        print(f"\n  [{typ.upper()}]{tag} — {len(targets)} targets")
+        print(f"  {'Rank':<5}{'X':>13}{'Y':>13}{'P_max':>9}{'Score':>9}"
+              f"{'Area km²':>10}{'Pri.':>6}")
         print(f"  {'─' * 65}")
         for t in targets[:limit]:
             print(f"  {t['rank']:<5}{t['x']:>13.1f}{t['y']:>13.1f}"
@@ -169,17 +169,17 @@ def describe_grid(path: str) -> str:
     lines = [
         f"{path}",
         f"  format     : {layer['format']}",
-        f"  boyut      : {layer['ny']} satır × {layer['nx']} sütun",
-        f"  X aralığı  : {layer['xmin']:.3f} → {layer['xmax']:.3f}  (dx={dx:.4g})",
-        f"  Y aralığı  : {layer['ymin']:.3f} → {layer['ymax']:.3f}  (dy={dy:.4g})",
-        f"  boş (NaN)  : %{100 * (1 - valid.size / g.size):.2f}",
-        f"  değerler   : min={valid.min():.6g}  max={valid.max():.6g}  "
-        f"ort={valid.mean():.6g}  std={valid.std():.6g}",
-        f"  CRS        : {layer.get('crs', 'belirtilmemiş')}",
-        f"  katman tipi: {detect_layer_type(layer['name'])} (isimden tahmin)",
+        f"  size       : {layer['ny']} rows × {layer['nx']} columns",
+        f"  X range    : {layer['xmin']:.3f} → {layer['xmax']:.3f}  (dx={dx:.4g})",
+        f"  Y range    : {layer['ymin']:.3f} → {layer['ymax']:.3f}  (dy={dy:.4g})",
+        f"  empty (NaN): {100 * (1 - valid.size / g.size):.2f}%",
+        f"  values     : min={valid.min():.6g}  max={valid.max():.6g}  "
+        f"mean={valid.mean():.6g}  std={valid.std():.6g}",
+        f"  CRS        : {layer.get('crs', 'not specified')}",
+        f"  layer type : {detect_layer_type(layer['name'])} (inferred from name)",
     ]
     for w in caught:
-        lines.append(f"  uyarı      : {w.message}")
+        lines.append(f"  warning    : {w.message}")
     return "\n".join(lines)
 
 
@@ -187,31 +187,31 @@ def build_parser() -> argparse.ArgumentParser:
     import geoai
 
     parser = argparse.ArgumentParser(
-        prog='geoai', description='GeoAI — jeofizik yapay zeka hedef belirleme sistemi')
+        prog='geoai', description='GeoAI — AI-driven geophysical target identification system')
     parser.add_argument('--version', action='version', version=f'geoai {geoai.__version__}')
     sub = parser.add_subparsers(dest='command', required=True)
 
-    p = sub.add_parser('demo', help='Sentetik veri ile tam pipeline demosu')
+    p = sub.add_parser('demo', help='Full pipeline demo on synthetic data')
     p.add_argument('--nx', type=int, default=120)
     p.add_argument('--ny', type=int, default=120)
     p.add_argument('--types', nargs='+', default=['mineral', 'groundwater'],
-                   help='Hedef tipleri (mineral, groundwater, geothermal)')
+                   help='Target types (mineral, groundwater, geothermal)')
     p.add_argument('--output-dir', default='output_demo')
     p.add_argument('--show-plots', action='store_true')
     p.add_argument('--no-save-plots', action='store_true')
     p.add_argument('--no-export-grids', action='store_true')
 
-    p = sub.add_parser('run', help='JSON konfigürasyonla gerçek veri çalıştırma')
-    p.add_argument('config', help='Proje konfigürasyon dosyası (.json)')
-    p.add_argument('--output-dir', default=None, help='Konfigürasyondaki çıkış klasörünü ez')
+    p = sub.add_parser('run', help='Run on real data using a JSON configuration')
+    p.add_argument('config', help='Project configuration file (.json)')
+    p.add_argument('--output-dir', default=None, help='Override the output directory from the configuration')
     p.add_argument('--show-plots', action='store_true')
 
-    p = sub.add_parser('info', help='Grid dosyalarının format/boyut/kapsam bilgisini göster')
+    p = sub.add_parser('info', help='Show format/size/extent information for grid files')
     p.add_argument('files', nargs='+')
 
-    p = sub.add_parser('template', help='Örnek proje konfigürasyonu yaz')
+    p = sub.add_parser('template', help='Write an example project configuration')
     p.add_argument('path', nargs='?', default='geoai_project.json')
-    p.add_argument('--force', action='store_true', help='Var olan dosyanın üzerine yaz')
+    p.add_argument('--force', action='store_true', help='Overwrite an existing file')
     return parser
 
 
@@ -234,7 +234,7 @@ def main(argv=None) -> int:
             _, results = run_from_config(cfg, output_dir=args.output_dir,
                                          show_plots=args.show_plots or None)
         except (ConfigError, FileNotFoundError, RuntimeError, ValueError) as e:
-            print(f"HATA: {e}", file=sys.stderr)
+            print(f"ERROR: {e}", file=sys.stderr)
             return 1
         print_targets(results)
         return 0
@@ -245,18 +245,18 @@ def main(argv=None) -> int:
             try:
                 print(describe_grid(f))
             except Exception as e:
-                print(f"{f}\n  HATA: {e}", file=sys.stderr)
+                print(f"{f}\n  ERROR: {e}", file=sys.stderr)
                 status = 1
         return status
 
     if args.command == 'template':
         path = Path(args.path)
         if path.exists() and not args.force:
-            print(f"HATA: {path} zaten var (üzerine yazmak için --force).", file=sys.stderr)
+            print(f"ERROR: {path} already exists (use --force to overwrite).", file=sys.stderr)
             return 1
         path.write_text(json.dumps(TEMPLATE, ensure_ascii=False, indent=2) + "\n",
                         encoding='utf-8')
-        print(f"✓ Örnek konfigürasyon yazıldı: {path}")
+        print(f"✓ Example configuration written: {path}")
         return 0
 
     return 2

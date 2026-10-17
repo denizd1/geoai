@@ -1,4 +1,4 @@
-"""Kuyu verisi yükleme testleri."""
+"""Well data loading tests."""
 import numpy as np
 import pandas as pd
 import pytest
@@ -35,7 +35,7 @@ def test_target_type_filter(tmp_path):
 
 
 def test_label_column_not_confused_with_target_type(tmp_path):
-    """TARGET_TYPE kolonu varken etiket 'HIT' gibi farklı isimde olabilir."""
+    """When a TARGET_TYPE column is present, the label column may have another name such as 'HIT'."""
     text = "Easting,Northing,TARGET_TYPE,HIT\n1,2,mineral,1\n3,4,mineral,0\n"
     df = load_well_data(_write(tmp_path, text))
     assert df['label'].tolist() == [1, 0]
@@ -43,7 +43,7 @@ def test_label_column_not_confused_with_target_type(tmp_path):
 
 
 def test_mineralized_label_not_taken_as_type(tmp_path):
-    text = "x,y,mineralized\n1,2,yes\n3,4,no\n5,6,Evet\n"
+    text = "x,y,mineralized\n1,2,yes\n3,4,no\n5,6,Evet\n"   # 'Evet' = Turkish alias for 'yes'
     df = load_well_data(_write(tmp_path, text))
     assert df['label'].tolist() == [1, 0, 1]
     assert 'target_type' not in df
@@ -58,7 +58,7 @@ def test_invalid_labels_raise(tmp_path):
 
 def test_missing_rows_are_dropped_with_warning(tmp_path):
     text = "X,Y,LABEL\n1,1,1\n,2,0\n3,3,\n4,4,0\n"
-    with pytest.warns(UserWarning, match='2 satır'):
+    with pytest.warns(UserWarning, match='2 rows'):
         df = load_well_data(_write(tmp_path, text))
     assert len(df) == 2
 

@@ -39,7 +39,7 @@ include = ["geoai*"]
 testpaths = ["tests"]
 pythonpath = ["."]
 markers = [
-    "slow: uçtan uca, uzun süren testler (seçmek için: -m slow, atlamak için: -m 'not slow')",
+    "slow: long-running end-to-end tests (select with: -m slow, skip with: -m 'not slow')",
 ]
 
 [tool.ruff]
@@ -48,5 +48,5 @@ target-version = "py39"
 extend-exclude = ["pdf"]
 
 [tool.ruff.lint]
-# Pyflakes (F) + sözdizimi/çalışma zamanı hataları (E9): stil yerine doğruluk kontrolü
+# Pyflakes (F) + syntax/runtime errors (E9): correctness checks rather than style
 select = ["E9", "F"]

@@ -1,4 +1,4 @@
-"""`python -m geoai` giriş noktası."""
+"""Entry point for `python -m geoai`."""
 import sys
 
 from geoai.cli import main

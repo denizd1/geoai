@@ -1,4 +1,4 @@
-"""Model, örnekleyici, SMOTE, eşik ve hedef çıkarımı testleri."""
+"""Tests for the model, sampler, SMOTE, threshold selection and target extraction."""
 import warnings
 
 import numpy as np
@@ -42,7 +42,7 @@ def test_geo_smote_counts_and_convexity(rng):
     syn = Xa[105:]
     lo, hi = X[:5].min(axis=0), X[:5].max(axis=0)
     assert np.all(syn >= lo - 1e-5) and np.all(syn <= hi + 1e-5)
-    # Zaten dengeli ise değişiklik yok
+    # No change if the data are already balanced
     Xb, yb = geo_smote(X, np.array([1] * 60 + [0] * 45), target_ratio=0.5)
     assert len(yb) == 105
 
@@ -80,21 +80,21 @@ def test_sampler_labels_precedence_groups_and_extra_negatives():
     wells = pd.DataFrame({
         'x': [100.0, 120.0, 300.0, 110.0, 5000.0],
         'y': [100.0, 100.0, 300.0, 100.0, 100.0],
-        'label': [1, 1, 0, 0, 1],               # (110,100) negatif, pozitif tampon içinde
+        'label': [1, 1, 0, 0, 1],               # (110,100) negative, inside the positive buffer
     })
     sampler = WellSampler(positive_buffer=2, negative_buffer=1, extra_negatives=25)
-    with pytest.warns(UserWarning, match='grid dışında'):
+    with pytest.warns(UserWarning, match='outside the grid'):
         X, y, g = sampler.sample(stack, wells, cr, return_groups=True)
     info = sampler.last_info
     assert info['n_pos_outside'] == 1
-    # İki pozitif kuyu: diskler (13 piksel) kısmen örtüşür → tekrarsız birleşim
+    # Two positive wells: their discs (13 pixels) partially overlap → union without duplicates
     pos_pixels = set()
     for cx in (10, 12):
         for dr, dc in _disk_offsets(2):
             pos_pixels.add((10 + dr, cx + dc))
     assert y.sum() == len(pos_pixels)
-    # (110,100) negatifi pozitif tampon içinde: etiketi pozitif kalır; kendi diskinin
-    # pozitif olmayan pikseli yok → kuyu kullanılmadı
+    # The (110,100) negative lies inside the positive buffer: the pixel keeps its positive label;
+    # its own disc has no non-positive pixel → the well is not used
     assert info['n_neg_wells_used'] == 1
     assert info['n_extra_negatives'] == 25
     assert (y == 0).sum() == 5 + 25
@@ -191,7 +191,7 @@ def test_predict_grid_masks_invalid(trained_model):
 def test_random_cv_fallback_with_single_positive_group(rng):
     X, y, g = _separable(rng, n_groups_pos=1, per=20)
     m = GeoProspectivityModel('generic')
-    with pytest.warns(UserWarning, match='rastgele'):
+    with pytest.warns(UserWarning, match='random'):
         m.train(X, y, groups=g, cv_folds=3, verbose=False)
     assert m.cv_info['strategy'] == 'random'
 
@@ -200,7 +200,7 @@ def test_train_input_validation(rng):
     X, y, g = _separable(rng)
     m = GeoProspectivityModel()
     with pytest.raises(ValueError):
-        m.train(X, y, cv_strategy='spatial', verbose=False)          # groups yok
+        m.train(X, y, cv_strategy='spatial', verbose=False)          # no groups
     Xn = X.copy()
     Xn[0, 0] = np.nan
     with pytest.raises(ValueError):
@@ -234,7 +234,7 @@ def test_apply_feature_weights_by_layer_type():
     assert apply_feature_weights(X, ['a', 'b', 'c'], 'generic') is X
 
 
-# ─── Hedef çıkarımı ─────────────────────────────────────────────────────────
+# ─── Target extraction ──────────────────────────────────────────────────────
 
 def _blob(n, r0, c0, sigma, amp):
     rr, cc = np.mgrid[0:n, 0:n]
@@ -277,7 +277,7 @@ def test_get_top_targets_min_distance_and_nan():
     cr = _coreg(n)
     prob = np.zeros((n, n))
     prob[10:13, 10:13] = 0.9
-    prob[10:13, 15:18] = 0.8                          # 5 piksel uzakta
+    prob[10:13, 15:18] = 0.8                          # 5 pixels away
     m = GeoProspectivityModel()
     assert len(m.get_top_targets(prob, np.zeros_like(prob), cr, min_prob=0.5,
                                  min_distance_pixels=10)) == 1
